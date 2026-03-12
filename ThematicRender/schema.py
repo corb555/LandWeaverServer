@@ -12,36 +12,15 @@ RENDER_SCHEMA: dict[str, Any] = {
     "override_factor": {"type": "string", "required": False},
     "debug_factors": {"type": "string", "required": False},
 
-    # ------------------------------------------------------------------
-    # File paths (strings).  can still apply prefix-based
-    # defaults; schema validates shape + required presence for core IO.
-    # ------------------------------------------------------------------
     "files": {
         "type": "dict", "required": True
-    }, "prefixed_files": {
-        "type": "dict", "required": False
-    }, # ------------------------------------------------------------------
-    # Enabled flags: ONLY factors
-    # ------------------------------------------------------------------
-    "enabled": {
-        "type": "dict", "required": False, "default": {},
-        # lets Cerberus create the block when omitted
-        "schema": {
-            "factors": {
-                "type": "dict", "required": False, "default": {},
-                # critical so defaults inside schema get applied
-                "valuesrules": {"type": "boolean"}, "schema": {
-                    "precip": {"type": "boolean", "default": True},
-                    "forest": {"type": "boolean", "default": True},
-                    "lith": {"type": "boolean", "default": True},
-                    "snow": {"type": "boolean", "default": True},
-                    "theme_alpha": {"type": "boolean", "default": True},
-                    "hillshade": {"type": "boolean", "default": True},
-                },
-            },
-        }, "allow_unknown": True,
     },
-
+    "prefixed_files": {
+        "type": "dict", "required": False
+    },
+    "theme_smoothing_specs": {
+        "type": "dict", "required": False
+    },
     # ------------------------------------------------------------------
     # Driver parameter blocks (NO per-driver enabled flags)
     # ------------------------------------------------------------------

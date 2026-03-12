@@ -1,8 +1,8 @@
-#keys.py
+# keys.py
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any,  Optional, Tuple, Set, FrozenSet, List, Dict, Protocol
+from typing import Any, Optional, Tuple, Set, FrozenSet, List, Dict, Protocol
 
 import numpy as np
 
@@ -64,7 +64,7 @@ class FileKey(StrEnum):
 class DriverSpec:
     dtype: np.dtype
     halo_px: int
-    cleanup_type: Optional[str] = None      # 'categorical' or 'continuous'
+    cleanup_type: Optional[str] = None  # 'categorical' or 'continuous'
     smoothing_radius: Optional[float] = None
 
 
@@ -99,7 +99,7 @@ class FactorSpec:
     files: FrozenSet[FileKey] = frozenset()
     required_noise: Optional[str] = None
     desc: str = ""
-
+    params: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True, slots=True)
 class _BlendSpec:
@@ -129,7 +129,7 @@ class _BlendSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class NoiseProfile:
+class NoiseSpec:
     id: str
     sigmas: Tuple[float, ...]
     weights: Tuple[float, ...]
@@ -139,7 +139,7 @@ class NoiseProfile:
 
 
 @dataclass(frozen=True, slots=True)
-class SurfaceModifierProfile:
+class SurfaceModifierSpec:
     """
     Parameters for applying noise-driven color mottle/perturbation to a surface.
 
@@ -169,7 +169,7 @@ class RequiredResources:
     anchor_key: DriverKey
 
     # Procedural Resources
-    noise_profiles: Dict[str, NoiseProfile]
+    noise_profiles: Dict[str, NoiseSpec]
 
     # Surface Management
     # The set of SurfaceKeys actually required by the BLEND_PIPELINE
@@ -189,7 +189,7 @@ class ResolvedManifest:
 
 
 @dataclass(frozen=True, slots=True)
-class FeatureSmoothingProfile:
+class ThemeSmoothingSpec:
     """
     Parameters for Raster Boundary Refinement and Generalization.
 
@@ -275,4 +275,3 @@ class _GatedStepSpec:
     default_fill: float
     lerp_low: float
     noise_id: str = ""
-

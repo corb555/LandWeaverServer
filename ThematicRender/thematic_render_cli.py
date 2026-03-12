@@ -1,18 +1,10 @@
 import argparse
 from pathlib import Path
-import sys
 
-from ThematicRender.config_mgr import ConfigMgr, analyze_pipeline
+from ThematicRender.config_mgr import ConfigMgr
 from ThematicRender.pipeline_engine import PipelineEngine
-from ThematicRender.settings import BLEND_PIPELINE, SURFACE_SPECS, FACTOR_SPECS
+from ThematicRender.settings import BLEND_PIPELINE
 
-import sys
-import argparse
-from pathlib import Path
-
-from ThematicRender.config_mgr import ConfigMgr, analyze_pipeline
-from ThematicRender.pipeline_engine import PipelineEngine
-from ThematicRender.settings import BLEND_PIPELINE, FACTOR_SPECS, SURFACE_SPECS
 
 def _validate_file_existence(cfg: ConfigMgr):
     """
@@ -28,6 +20,7 @@ def _validate_file_existence(cfg: ConfigMgr):
         if not path.exists():
             raise FileNotFoundError(f"Required input file missing: [{key}] -> {path}")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Thematic Render Pipeline")
 
@@ -40,7 +33,9 @@ def main():
 
     # Operational flags
     parser.add_argument("--describe", action="store_true", help="Generate pipeline description")
-    parser.add_argument("--describe_only", action="store_true", help="Generate description and EXIT")
+    parser.add_argument(
+        "--describe_only", action="store_true", help="Generate description and EXIT"
+        )
     parser.add_argument("--multi", action="store_true", help="Multiprocess")
 
     # Preview Params
@@ -53,11 +48,8 @@ def main():
 
     # 1. Load, Fuse, and Resolve Config
     try:
-        # The new atomic factory method
         config = ConfigMgr.build(
-            config_path=Path(args.config),
-            prefix=args.prefix,
-            output_override=args.output
+            config_path=Path(args.config), prefix=args.prefix, output_override=args.output
         )
 
         # Perform physical disk checks
@@ -70,27 +62,9 @@ def main():
     print(f"Config File: {args.config}\n")
 
     # 2. Initialize Engine
-    pipeline_eng = PipelineEngine(config, BLEND_PIPELINE, args.percent, args.row, args.col, args.multi)
-
-    # 3. Handle Documentation / Diagnostics
-    if args.describe or args.describe_only:
-        desc_file = f"{args.prefix}_describe.md"
-
-        # analyze_pipeline now uses the simplified ConfigMgr
-        report = analyze_pipeline(
-            cfg=pipeline_eng.cfg,
-            resources=pipeline_eng.resources,
-            pipeline=pipeline_eng.pipeline,
-            factor_specs=FACTOR_SPECS,
-            surface_specs=SURFACE_SPECS
+    pipeline_eng = PipelineEngine(
+        config, BLEND_PIPELINE, args.percent, args.row, args.col, args.multi
         )
-
-        with open(desc_file, "w") as f:
-            f.write(report)
-        print(f"✅ Pipeline description generated in: {desc_file}\n")
-
-        if args.describe_only:
-            sys.exit(0)
 
     # 4. Execute Render
     try:
@@ -105,6 +79,7 @@ def main():
         print(f"\n❌ Pipeline error: {e}")
         import traceback
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()

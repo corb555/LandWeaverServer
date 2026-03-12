@@ -1,27 +1,26 @@
 from functools import wraps
 from typing import Callable, Dict, Any
-import warnings
 
 import numpy as np
 
-from ThematicRender.utils import print_once, stats_once
+from ThematicRender.keys import DriverKey
 
-#surface_library.py
-# --- Surface Provider Registry ---
+# surface_library.py
 SURFACE_PROVIDER_REGISTRY: Dict[str, Callable] = {}
 
 
 def spatial_surface(provider_id: str):
     """
     Updated Decorator Contract:
-    Receives 6 arguments (ctx, spec, val_2d, vld_2d, factors_2d, style_engine)
+    Receives 6 arguments (ctx, spec, data_2d, masks_2d, factors_2d, style_engine)
     Enforces (H, W, 3) float32 output.
     """
+
     def decorator(func):
         @wraps(func)
-        def wrapper(ctx, spec, val_2d, vld_2d, factors_2d, style_engine):
+        def wrapper(ctx, spec, data_2d, masks_2d, factors_2d, style_engine):
             # Pass all 6 arguments to the underlying provider function
-            res = func(ctx, spec, val_2d, vld_2d, factors_2d, style_engine)
+            res = func(ctx, spec, data_2d, masks_2d, factors_2d, style_engine)
 
             if res is None:
                 return np.zeros((*ctx.target_shape, 3), dtype="float32")
@@ -34,11 +33,12 @@ def spatial_surface(provider_id: str):
 
         SURFACE_PROVIDER_REGISTRY[provider_id] = wrapper
         return wrapper
+
     return decorator
 
 
 @spatial_surface("ramp")
-def _ramp_provider(ctx, spec, val_2d, vld_2d, factors_2d, style_engine):
+def _ramp_provider(ctx, spec, data_2d, masks_2d, factors_2d, style_engine):
     # This factor is "elev_m" (Raw Meters)
     f_id = spec.coord_factor
     factor_val = factors_2d.get(f_id)
@@ -49,35 +49,42 @@ def _ramp_provider(ctx, spec, val_2d, vld_2d, factors_2d, style_engine):
     coords = np.clip(factor_val, u_min, u_max)
     return interp_func(coords)
 
-@spatial_surface("style")
-def _style_provider(ctx, spec, val_2d, vld_2d, factors_2d, style_engine):
+@spatial_surface("theme")
+def _style_provider(ctx, spec, data_2d, masks_2d, factors_2d, style_engine):
     """
     Fetches categorical RGB.
-    NOTE: We pass val_2d to the style engine  instead of DriverBlocks.
     """
-    # The Theme Engine (style_engine) must be updated to accept a dict
-    # of arrays instead of a dict of objects.
-    rgb_full = style_engine.get_theme_surface(val_2d, context=f"surface:{spec.key.value}")
+    # 1. Extract the specific thematic array from the  dictionary
+    theme_ids = data_2d.get(DriverKey.THEME)
 
-    if rgb_full is None:
-        return np.zeros((*ctx.target_shape, 3), dtype="float32")
+    if theme_ids is None:
+        raise ValueError(f"Error: Surface Library 'style': {DriverKey.THEME} not found")
 
-    return rgb_full
+    # 2. Pass the ARRAY, not the DICTIONARY, to the style engine
+    return style_engine.get_theme_surface(theme_ids)
+
 
 MODIFIER_REGISTRY: Dict[str, Callable] = {}
+
 
 def register_modifier(mod_id: str):
     def decorator(func):
         MODIFIER_REGISTRY[mod_id] = func
         return func
+
     return decorator
+
 
 @register_modifier("mottle")
 def _mottle_modifier(img_block: np.ndarray, noise: np.ndarray, profile: Any) -> np.ndarray:
     """
-    Standard Mottle: (H,W,3) + ((H,W,1) * (3,))
+    Standard Mottle: Centered at 0 to provide dark and light variation.
     """
-    # Contract: noise is guaranteed (H,W,1) by Engine.
-    # shift_vector is (3,)
-    shift = (noise * np.array(profile.shift_vector, dtype="float32")) * profile.intensity
+    # Shift noise from [0.0, 1.0] to [-0.5, 0.5]
+    centered_noise = noise - 0.5
+
+    # Calculate RGB shift
+    shift = (centered_noise * np.array(profile.shift_vector, dtype="float32")) * profile.intensity
+
+    # Apply and clip to valid 8-bit color range
     return np.clip(img_block + shift, 0, 255)

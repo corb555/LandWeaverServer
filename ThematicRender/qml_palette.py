@@ -71,27 +71,38 @@ class QmlPalette:
         return {self.value_for_label(lbl) for lbl in labels}
 
     def build_lut_rgb(
-            self, *, size: int = DEFAULT_LUT_SIZE, fill_rgb: RGB = (0, 0, 0), ) -> np.ndarray:
-        """Build dense RGB LUT for uint8 index rasters.
-
-        Returns:
-            (size, 3) uint8 LUT.
-        """
+            self, *, size: int = 256, fill_rgb: tuple = (0, 0, 0)
+    ) -> np.ndarray:
+        """Build dense RGB LUT for uint8 index rasters with diagnostic logging."""
         if size <= 0:
             raise ValueError(f"LUT size must be > 0, got {size}")
 
         lut = np.empty((size, 3), dtype=np.uint8)
         lut[:, :] = np.asarray(fill_rgb, dtype=np.uint8)
 
-        for v, entry in self.entries_by_value.items():
-            if 0 <= int(v) < size:
+        print("\n Building Thematic Color LUT :")
+        print(f"{'ID':>4} | {'Label':<30} | {'RGB':<12} | {'Hex'}")
+        print("-" * 65)
+
+        # Sort by value so the terminal output is easy to read
+        sorted_entries = sorted(self.entries_by_value.items(), key=lambda x: int(x[0]))
+
+        for v_str, entry in sorted_entries:
+            v = int(v_str)
+            if 0 <= v < size:
                 rgb = _parse_color_attr(entry.color_hex)
                 if rgb is not None:
-                    lut[int(v), :] = np.asarray(rgb, dtype=np.uint8)
+                    lut[v, :] = np.asarray(rgb, dtype=np.uint8)
 
+                    # Log the mapping
+                    label = getattr(entry, 'label', 'Unknown')
+                    if label and label[0].isalpha():
+                        print(f"{v:>4} | {label:<40} | {str(rgb)}")
+
+        print("-" * 65 + "\n")
         return lut
 
-    def build_lut_rgba(
+    def build_lut_rgb_a(
             self, *, size: int = DEFAULT_LUT_SIZE,
             fill_rgba: RGBA = (0, 0, 0, 255), ) -> np.ndarray:
         """Build dense RGBA LUT for uint8 index rasters (QGIS-consistent alpha).

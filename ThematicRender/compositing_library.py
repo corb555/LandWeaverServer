@@ -1,10 +1,10 @@
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List
 
 import numpy as np
 
 
-#compositing_library.py
+# compositing_library.py
 
 @dataclass(slots=True)
 class OpMetadata:
@@ -15,18 +15,20 @@ class OpMetadata:
     required_params: List[str]
     description: str
 
+
 COMPOSITING_REGISTRY: Dict[str, OpMetadata] = {}
+
 
 def register_op(name: str, required_attrs: List[str] = None, required_params: List[str] = None):
     def decorator(func):
         COMPOSITING_REGISTRY[name] = OpMetadata(
-            func=func,
-            required_attrs=required_attrs or [],
-            required_params=required_params or [],
+            func=func, required_attrs=required_attrs or [], required_params=required_params or [],
             description=func.__doc__ or ""
         )
         return func
+
     return decorator
+
 
 class CompositingLibrary:
     """
@@ -51,6 +53,10 @@ class CompositingLibrary:
         _validate_spatial(p_a, spec.input_surfaces[0], ctx.target_shape)
         _validate_spatial(p_b, spec.input_surfaces[1], ctx.target_shape)
 
+        # debug_factor = "lith"
+        # if spec.factor_nm == debug_factor:
+        #        print(f"  ∟ [9] lerp_surfaces:  Min:{factor.min():.3f} | Max:{factor.max():.3f} |")
+
         # (H, W, 3) blended by (H, W, 1)
         surfaces[spec.output_surface] = p_a + factor * (p_b - p_a)
 
@@ -63,7 +69,6 @@ class CompositingLibrary:
         _validate_spatial(target_rgb, spec.input_surfaces[0], ctx.target_shape)
         _validate_spatial(current, spec.buffer, ctx.target_shape)
 
-        # In-place buffer update
         buffers[spec.buffer] = current + factor * (target_rgb - current)
 
     @staticmethod
@@ -84,7 +89,7 @@ class CompositingLibrary:
         _validate_spatial(under, spec.buffer, ctx.target_shape)
         _validate_spatial(over, spec.input_surfaces[0], ctx.target_shape)
 
-        a = factor # (H, W, 1)
+        a = factor
         buffers[spec.buffer] = (over * a) + (under * (1.0 - a))
 
     @staticmethod
@@ -102,7 +107,9 @@ class CompositingLibrary:
         buffers[spec.buffer] = under + factor * (over - under)
 
     @staticmethod
-    @register_op("add_specular_highlights", required_attrs=["buffer", "factor_nm"], required_params=["color"])
+    @register_op(
+        "add_specular_highlights", required_attrs=["buffer", "factor_nm"], required_params=["color"]
+        )
     def add_specular(buffers, surfaces, factors, factor, spec, ctx):
         current = buffers.get(spec.buffer)
         _validate_spatial(current, spec.buffer, ctx.target_shape)
@@ -110,7 +117,6 @@ class CompositingLibrary:
         color = np.array(spec.params["color"], dtype="float32").reshape(1, 1, 3)
         intensity = float(spec.params.get("intensity", 1.0))
 
-        # factor is (H, W, 1), color is (1, 1, 3)
         reflection = (factor * color) * intensity
         buffers[spec.buffer] = np.clip(current + reflection, 0, 255)
 
@@ -121,6 +127,7 @@ class CompositingLibrary:
         if src_name not in buffers:
             raise KeyError(f"Write Output failed: Buffer '{src_name}' not found.")
         buffers["__final_output__"] = buffers[src_name]
+
 
 # --- Internal Validation ---
 
@@ -133,6 +140,8 @@ def _validate_spatial(arr: np.ndarray, label: str, target_hw: tuple):
         # We allow 4 for RGBA but prefer 3 for this standard pipeline
         if arr.shape[2] != 4:
             raise ValueError(f"Channel Mismatch: '{label}' is {arr.shape}, expected (H, W, 3)")
+
+
 # ---  Utilities ---
 
 def alpha_over(under_rgb: np.ndarray, over_rgb: np.ndarray, over_a: np.ndarray) -> np.ndarray:

@@ -1,14 +1,11 @@
 # pipeline_engine.py
+from contextlib import ExitStack
+import multiprocessing as mp
 import os
 from pathlib import Path
 import time
 import traceback
 from typing import Dict, Any
-
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import get_context, Process, Queue
-import multiprocessing as mp
-from contextlib import ExitStack
 
 import numpy as np
 import rasterio
@@ -16,18 +13,20 @@ from rasterio.windows import Window
 from tqdm import tqdm
 
 from ThematicRender.compositing_engine import CompositingEngine
-from ThematicRender.config_mgr import ConfigMgr, derive_resources
+from ThematicRender.compositing_library import COMPOSITING_REGISTRY
+from ThematicRender.config_mgr import ConfigMgr, derive_resources, analyze_pipeline
 from ThematicRender.factor_engine import FactorEngine
-from ThematicRender.ipc_blocks import  PoolSpec, SharedMemoryPool
+from ThematicRender.ipc_packets import PoolSpec, SharedMemoryPool
 from ThematicRender.keys import DriverKey
-from ThematicRender.noise_registry import NoiseRegistry
+from ThematicRender.noise_library import NoiseLibrary
 from ThematicRender.pipeline_tasks import ReaderContext, WorkerContext, WriterContext, read_task, \
-    render_task, write_task, writer_worker_loop, render_worker_task, render_worker_loop
+    render_task, write_task, writer_worker_loop, render_worker_loop
 from ThematicRender.raster_manager import RasterManager
 from ThematicRender.settings import FACTOR_SPECS, SURFACE_SPECS
 from ThematicRender.surface_engine import SurfaceEngine
 from ThematicRender.theme_registry import ThemeRegistry
-from ThematicRender.utils import TimerStats
+from ThematicRender.utils import TimerStats, GenMarkdown
+
 
 # pipeline_engine.py
 class PipelineEngine:
@@ -41,8 +40,9 @@ class PipelineEngine:
         self.tmr = TimerStats()
 
         # 1. Initialize Engines
-        self.surfaces = SurfaceEngine(cfg)
+        self.surface_eng = SurfaceEngine(cfg)
         self.themes = ThemeRegistry(cfg)
+        self.themes.load_metadata()
         self.compositor = CompositingEngine(self.tmr)
 
         # 2. Map Resources
@@ -51,10 +51,11 @@ class PipelineEngine:
         )
 
         # 3. Initialize Shared Resources
-        self.noise_registry = NoiseRegistry(cfg, self.resources.noise_profiles)
-        self.factors = FactorEngine(
+        self.noise_registry = NoiseLibrary(cfg, self.resources.noise_profiles)
+        self.factor_eng = FactorEngine(
             cfg=self.cfg, themes=self.themes, noise_registry=self.noise_registry,
-            factor_specs=FACTOR_SPECS, resources=self.resources, timer=self.tmr)
+            factor_specs=FACTOR_SPECS, resources=self.resources, timer=self.tmr
+        )
         self.pipeline = pipeline
 
         # 4. Handle Preview Params
@@ -66,24 +67,24 @@ class PipelineEngine:
     def process_rasters(self) -> None:
         # Simple stats accumulator
         stats = {
-            "read": 0.0, "render": 0.0, "write": 0.0,
-            "flush": 0.0, "init" : 0.0, "cleanup": 0.0, "count": 0
+            "read": 0.0, "render": 0.0, "write": 0.0, "flush": 0.0, "init": 0.0, "cleanup": 0.0,
+            "count": 0
         }
         total_start = time.perf_counter()
+        multiprocess = True
 
         with ExitStack() as stack:
             out_path = self.cfg.path("output")
 
             # 1. Define Pool Specs (256x256 tiles, 3 bands for RGB)
             out_spec = PoolSpec(
-                value_shape=(3, 256, 256), # RGB
-                value_dtype=np.dtype(np.uint8),
-                valid_shape=(1, 256, 256), # Alpha/Mask
-                valid_dtype=np.dtype(np.float32)
+                data_shape=(3, 256, 256),  # RGB
+                data_dtype=np.dtype(np.uint8), mask_shape=(1, 256, 256),  # Alpha/Mask
+                mask_dtype=np.dtype(np.float32)
             )
             # Initialize the pool for the output buffers
             output_pool = SharedMemoryPool(out_spec, slots=16, prefix="tr_output")
-            stack.callback(output_pool.cleanup) # Ensure cleanup is registered immediately
+            stack.callback(output_pool.cleanup)  # Ensure cleanup is registered immediately
 
             with RasterManager(self.cfg, self.resources.drivers, self.resources.anchor_key) as io:
                 # 2. PREVIEW LOGIC FIRST
@@ -98,11 +99,12 @@ class PipelineEngine:
                         io.anchor_src, percent=self.percent, rel_x=self.col, rel_y=self.row
                     )
                     if envelope is not None:
-                        profile.update({
-                            "width": int(envelope.width),
-                            "height": int(envelope.height),
-                            "transform": io.anchor_src.window_transform(envelope),
-                        })
+                        profile.update(
+                            {
+                                "width": int(envelope.width), "height": int(envelope.height),
+                                "transform": io.anchor_src.window_transform(envelope),
+                            }
+                        )
                         write_offset_row = int(envelope.row_off)
                         write_offset_col = int(envelope.col_off)
 
@@ -124,8 +126,7 @@ class PipelineEngine:
                 if envelope is not None:
                     win_list = [Window(
                         col_off=int(w.col_off) + write_offset_col,
-                        row_off=int(w.row_off) + write_offset_row,
-                        width=int(w.width),
+                        row_off=int(w.row_off) + write_offset_row, width=int(w.width),
                         height=int(w.height)
                     ) for w in dst_windows]
                 else:
@@ -134,81 +135,60 @@ class PipelineEngine:
                 # 6. BUILD CONTEXTS
                 reader_ctx = ReaderContext(io=io, pool_map=self.pool_map)
                 worker_ctx = WorkerContext(
-                    cfg=self.cfg,
-                    pool_map=self.pool_map,
-                    factors_engine=self.factors,
-                    surfaces_engine=self.surfaces,
-                    themes=self.themes,
-                    compositor=self.compositor,
-                    pipeline=self.pipeline,
+                    cfg=self.cfg, pool_map=self.pool_map, factors_engine=self.factor_eng,
+                    surfaces_engine=self.surface_eng, themes=self.themes,
+                    compositor=self.compositor, pipeline=self.pipeline,
                     anchor_key=self.resources.anchor_key,
-                    surface_inputs=self.resources.surface_inputs,
-                    resources=self.resources,
-                    noise_registry=self.noise_registry,
-                    out_pool=output_pool # Connect the output pool here
+                    surface_inputs=self.resources.surface_inputs, resources=self.resources,
+                    noise_registry=self.noise_registry, out_pool=output_pool
                 )
 
                 writer_ctx = WriterContext(
-                    output_path=out_path,
-                    output_profile=profile,
-                    pool_map=self.pool_map,
-                    write_offset_row=write_offset_row,
-                    write_offset_col=write_offset_col,
-                    out_pool=output_pool # Connect the output pool here
+                    output_path=out_path, output_profile=profile, pool_map=self.pool_map,
+                    write_offset_row=write_offset_row, write_offset_col=write_offset_col,
+                    out_pool=output_pool  # Connect the output pool here
                 )
+                #  Generate the report in Main (where it only runs once)
+                report = analyze_pipeline(worker_ctx)
+                with open("pipeline_describe.md", "w") as f:
+                    f.write(report)
+
                 init_duration = time.perf_counter() - total_start
                 stats["init"] = init_duration
 
-                # 7. PROCESSING
-                if not self.multitthread:
-                    # ---  SINGLE THREADED ---
-                    progress_bar = tqdm(win_list, desc="Rendering (ST)")
-                    for seq, window in enumerate(progress_bar):
-                        work_packet = read_task(seq=seq, window=window, ctx=reader_ctx)
-                        stats["read"] += work_packet.read_duration
-
-                        result_packet = render_task(packet=work_packet, ctx=worker_ctx)
-                        stats["render"] += result_packet.render_duration
-
-                        stats["write"] += write_task(packet=result_packet, ctx=writer_ctx)
-                        stats["count"] += 1
-
-                    f_start = time.perf_counter()
-                    writer_ctx.close()
-                    stats["write"] += (time.perf_counter() - f_start)
-                else:
+                if multiprocess:
                     # --- PHASE 3: MULTIPROCESSING ---
-                    print(f" Launching Pipeline [Multiprocessor: {os.cpu_count()-1} render cores]")
+                    print(
+                        f" Launching Pipeline [Multiprocessor: {os.cpu_count() - 1} render cores]"
+                        )
 
                     # 1. Get the Spawn Context
                     ctx_mp = mp.get_context('spawn')
 
                     # 2. Setup Shared Queues
-                    work_queue = ctx_mp.Queue(maxsize=4) # Small buffer for backpressure
+                    work_queue = ctx_mp.Queue(maxsize=4)  # Small buffer for backpressure
                     result_queue = ctx_mp.Queue()
 
                     # 3. Start Dedicated Writer
                     writer_p = ctx_mp.Process(
-                        target=writer_worker_loop,
-                        args=(result_queue, writer_ctx)
+                        target=writer_worker_loop, args=(result_queue, writer_ctx)
                     )
                     writer_p.start()
 
                     # 4. Start Render Worker Pool
                     # We save 1 core for the Reader/Main and 1 for the Writer
-                    num_workers = 3 #max(1, os.cpu_count() - 2)
+                    num_workers = 3  # max(1, os.cpu_count() - 2)
                     workers = []
                     for i in range(num_workers):
                         p = ctx_mp.Process(
-                            target=render_worker_loop,
-                            args=(work_queue, result_queue, worker_ctx)
+                            target=render_worker_loop, args=(work_queue, result_queue, worker_ctx)
                         )
                         p.start()
                         workers.append(p)
 
                     # 5. READER LOOP (Main Process)
                     try:
-                        progress_bar = tqdm(win_list, desc="Processing")
+                        progress_bar = tqdm(win_list, desc="Rendering (MP)")
                         for seq, window in enumerate(progress_bar):
                             # This will naturally block if SHM slots are full
                             work_packet = read_task(seq=seq, window=window, ctx=reader_ctx)
@@ -225,10 +205,36 @@ class PipelineEngine:
                         # Send None to writer
                         result_queue.put(None)
                         writer_p.join()
+                # 7. PROCESSING
+                else:
+                    # ---  SINGLE THREADED ---
+                    debug_mode = False
+                    limit = 10
+                    if debug_mode:
+                        print(f"🔬 DEBUG MODE: Processing first {limit} blocks...")
+                        active_windows = win_list[:limit]
+                        iterable = enumerate(active_windows)
+                    else:
+                        active_windows = win_list
+                        iterable = enumerate(tqdm(active_windows, desc="Rendering (ST)"))
+
+                    for seq, window in iterable:
+                        work_packet = read_task(seq=seq, window=window, ctx=reader_ctx)
+                        stats["read"] += work_packet.read_duration
+
+                        result_packet = render_task(packet=work_packet, ctx=worker_ctx)
+                        stats["render"] += result_packet.render_duration
+
+                        stats["write"] += write_task(packet=result_packet, ctx=writer_ctx)
+                        stats["count"] += 1
+
+                    f_start = time.perf_counter()
+                    writer_ctx.close()
+                    stats["write"] += (time.perf_counter() - f_start)
 
         # This is where the deferred write time actually happens
         writer_ctx.close()
-        flush_duration = 0 #time.perf_counter() - flush_start
+        flush_duration = 0  # time.perf_counter() - flush_start
         stats["flush"] = flush_duration
         stats["write"] += flush_duration
         print(f"\nDisk Flush:      {flush_duration:.2f}s")
@@ -239,10 +245,11 @@ class PipelineEngine:
     @staticmethod
     def _print_stats_report(stats, total_elapsed):
         n = stats["count"] or 1
-        sum_parts = stats['init'] + stats['read'] + stats['render'] + stats['write'] + stats['cleanup']
+        sum_parts = stats['init'] + stats['read'] + stats['render'] + stats['write'] + stats[
+            'cleanup']
         unknown = total_elapsed - sum_parts
 
-        print("="*40)
+        print("=" * 40)
         print(f"Init:         {stats['init']:7.2f}s")
         print(f"Read:         {stats['read']:7.2f}s")
         print(f"Render:       {stats['render']:7.2f}s")
@@ -258,7 +265,7 @@ class PipelineEngine:
         parallel_potential = stats['read'] + stats['render'] + stats['write']
         efficiency = parallel_potential / (total_elapsed - stats['init'] - stats['cleanup'])
         print(f"Efficiency:   {efficiency:7.2f}x")
-        print("="*40 + "\n")
+        print("=" * 40 + "\n")
 
     def _create_pool_map(self, io, dst) -> Dict[DriverKey, SharedMemoryPool]:
         block_h, block_w = dst.block_shapes[0]
@@ -267,19 +274,19 @@ class PipelineEngine:
         max_halo = max([self.cfg.get_spec(k).halo_px for k in io.sources.keys()])
         pool_h, pool_w = block_h + 2 * max_halo, block_w + 2 * max_halo
 
-        slots = 16 # Adjust based on RAM
+        slots = 16  # Adjust based on RAM
         pool_map = {}
 
-        for dkey in io.sources.keys():
-            dspec = self.cfg.get_spec(dkey)
-            val_dtype = np.uint8 if dspec.dtype == np.uint8 else np.float32
+        for drv_key in io.sources.keys():
+            drv_spec = self.cfg.get_spec(drv_key)
+            val_dtype = np.uint8 if drv_spec.dtype == np.uint8 else np.float32
 
             spec = PoolSpec(
-                value_shape=(pool_h, pool_w), value_dtype=np.dtype(val_dtype),
-                valid_shape=(pool_h, pool_w, 1), valid_dtype=np.dtype(np.float32)
+                data_shape=(pool_h, pool_w), data_dtype=np.dtype(val_dtype),
+                mask_shape=(pool_h, pool_w, 1), mask_dtype=np.dtype(np.float32)
             )
             # Use a unique prefix per driver to avoid name collisions in the OS
-            pool_map[dkey] = SharedMemoryPool(spec, slots, prefix=f"tr_{dkey.value}")
+            pool_map[drv_key] = SharedMemoryPool(spec, slots, prefix=f"tr_{drv_key.value}")
 
         return pool_map
 
@@ -303,7 +310,7 @@ class PipelineEngine:
 
         return Window(
             col_off, row_off, min(target_w, full_w - col_off), min(target_h, full_h - row_off)
-            )
+        )
 
     @staticmethod
     def _build_output_profile(io: RasterManager) -> dict:
@@ -317,10 +324,11 @@ class PipelineEngine:
 
     def load_ramps(self) -> None:
         """Load ramps and update config paths."""
-        ramp_files = self.surfaces.load_surface_ramps(self.resources)
+        ramp_files = self.surface_eng.load_surface_ramps(self.resources)
         # Note: In Phase 3, this will be handled before ConfigMgr is locked
         # For now, we update the existing files dict
         self.cfg.files.update({k: Path(v) for k, v in ramp_files.items()})
+
 
 def on_worker_done(future):
     try:
@@ -328,3 +336,4 @@ def on_worker_done(future):
     except Exception as e:
         print(f"🔥 WORKER CRASHED: {e}")
         traceback.print_exc()
+

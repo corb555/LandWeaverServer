@@ -1,12 +1,10 @@
 from dataclasses import dataclass
-import sys
 from types import SimpleNamespace
 from typing import Protocol, Callable, Mapping, Any, List
 
 import numpy as np
 from rasterio.windows import Window
 
-from ThematicRender.keys import DriverKey
 from ThematicRender.utils import print_once
 
 
@@ -30,68 +28,84 @@ class FactorEngine:
         for spec in self.specs:
             fn = FACTOR_REGISTRY.get(spec.function_id)
             if fn is None:
-                raise KeyError(f"Factor function_id '{spec.function_id}' not found.")
+                # Retrieve and sort available keys for a readable list
+                available = sorted(FACTOR_REGISTRY.keys())
+
+                raise KeyError(
+                    f"\n❌ Factor Engine Initialization Error:\n"
+                    f"   Factor '{spec.name}' requested an unknown function_id: '{spec.function_id}'.\n"
+                    f"   Check your FACTOR_SPECS in settings.py or biome.yml for typos.\n"
+                    f"   Available Function IDs: {available}"
+                )
+
             self._compiled.append((spec, fn))
 
-    def generate_factors(self, val_2d: dict, vld_2d: dict, window: Window, anchor_key: Any) -> dict:
+    def generate_factors(
+            self, data_2d: dict, masks_2d: dict, window: Window, anchor_key: Any
+    ) -> dict:
         """
-        Receives 2D sanitized arrays.
-        Outputs (H, W, 1) for the storage layer.
+        Generates semantic factors (alpha masks) from raw GIS data.
+
+        The pipeline definition controls which factors to call from the factor library.
+        The engine acts as the orchestrator, preparing the shared context and
+        executing the specified factor library functions in order.
         """
         factors = {}
 
-        # 1. Determine master dimensions from the 2D anchor
-        target_h, target_w = val_2d[anchor_key].shape[:2]
-        self._debug_driver_stats(val_2d=val_2d, vld_2d=vld_2d, driver_key=DriverKey.DEM, name="DEM")
+        # Use the anchor driver to establish the master spatial resolution for this tile
+        target_h, target_w = data_2d[anchor_key].shape[:2]
 
-        # 2. Context setup  uses 2D dicts
+        # Retrieve the set of factors required by the current pipeline definition
+        required_factors = self.resources.factor_inputs
+
+        # Prepare a unified context object for library functions to consume
+        # 1. Create the base context
         ctx = SimpleNamespace(
             cfg=self.cfg,
             themes=self.themes,
             noises=self.noise_registry,
-            window=window, # Global window for noise coordinates
-            val_2d=val_2d, # Sanitized 2D values
-            vld_2d=vld_2d, # Sanitized 2D validity masks
+            window=window,
+            data_2d=data_2d,
+            masks_2d=masks_2d,
             factors=factors,
             target_shape=(target_h, target_w),
             anchor_key=anchor_key,
             tmr=self.tmr
         )
 
-        required_factors = self.resources.factor_inputs
-
         for spec, fn in self._compiled:
             if spec.name not in required_factors:
                 continue
 
+            # --- Ensure drivers setting exists for this factor ---
+            if spec.name not in self.cfg.logic:
+                raise KeyError(f"\n❌ Config error: Factor '{spec.name}' has no drivers entry in config.")
+
+            ctx.spec = spec
+
             try:
-                # --- CALL LIBRARY (2D COMPUTE) ---
-                # The library function 'fn'  operates in a pure 2D environment
+                # global override for debugging - replaces factor with all ones
                 override_target = self.cfg.get_global("override_factor")
                 if override_target == spec.name:
                     res = np.ones((target_h, target_w, 1), dtype="float32")
                 else:
-                    #  run the math
-                    res = fn(val_2d, vld_2d, spec.name, ctx)
+                    # INVOKE LIBRARY:  call the external function defined in factor_library
+                    res = fn(data_2d, masks_2d, spec.name, ctx)
 
                 if res is None:
-                    raise ValueError("Returned None")
+                    raise ValueError(f"Factor library function {spec.name} returned None")
 
-                f_max = float(res.max())
-                """  if f_max > 1e-5:
-                    print_once(f"found_{spec.name}",
-                               f"✨ [STATS] Factor {spec.name: <10} | "
-                               f"min: {res.min():.4f} | max: {f_max:.4f} | "
-                               f"mean: {res.mean():.4f}")"""
-
-                # We add the band dimension ONCE here before storing.
+                # THE STORAGE CONTRACT: Convert 2D compute results into 3D (H, W, 1) semantic masks
                 if res.ndim == 2:
                     res = res[..., np.newaxis]
 
-                # Validation remains as a safety check for the Engine boundaries
+                # VALIDATION: Ensure the library output aligns with the master tile geometry
                 if res.shape != (target_h, target_w, 1):
-                    raise ValueError(f"Shape mismatch: Expected ({target_h}, {target_w}, 1), got {res.shape}")
+                    raise ValueError(
+                        f"Shape mismatch: Expected ({target_h}, {target_w}, 1), got {res.shape}"
+                    )
 
+                # Store the standardized factor for use in the compositor or by downstream factors
                 factors[spec.name] = res.astype("float32")
 
             except MemoryError as e:
@@ -100,34 +114,29 @@ class FactorEngine:
         return factors
 
     def _debug_driver_stats(
-            self,
-            *,
-            val_2d: dict,
-            vld_2d: dict,
-            driver_key: Any,
-            name: str,
-    ) -> None:
+            self, *, data_2d: dict, masks_2d: dict, driver_key: Any, name: str, ) -> None:
         """Print one-time debug stats for a driver array (DEM, etc.)."""
-        if driver_key not in val_2d:
-            print_once(f"missing_{name}", f"⚠️  [STATS] {name}: driver missing from val_2d")
+        if driver_key not in data_2d:
+            print_once(f"missing_{name}", f"⚠️  [STATS] {name}: driver missing from data_2d")
             return
 
-        arr = val_2d[driver_key]
-        vld = vld_2d.get(driver_key)
+        arr = data_2d[driver_key]
+        mask = masks_2d.get(driver_key)
 
-        # Handle vld that might be (H,W,1)
-        if vld is not None and getattr(vld, "ndim", 0) == 3:
-            vld = vld[..., 0]
+        # Handle mask that might be (H,W,1)
+        if mask is not None and getattr(mask, "ndim", 0) == 3:
+            mask = mask[..., 0]
 
         a_min = float(np.nanmin(arr))
         a_max = float(np.nanmax(arr))
         a_mean = float(np.nanmean(arr))
 
-        msg = f"📦 [DRIVER] {name:<8} dtype={arr.dtype} shape={arr.shape} min={a_min:.2f} max={a_max:.2f} mean={a_mean:.2f}"
+        msg = (f"📦 [DRIVER] {name:<8} dtype={arr.dtype} shape={arr.shape} min={a_min:.2f} max="
+               f"{a_max:.2f} mean={a_mean:.2f}")
 
-        if vld is not None:
-            v_mean = float(np.mean(vld))
-            v_zeros = float(np.mean(vld <= 0.0))
+        if mask is not None:
+            v_mean = float(np.mean(mask))
+            v_zeros = float(np.mean(mask <= 0.0))
             msg += f" | valid_mean={v_mean:.3f} valid_zeros={v_zeros:.3f}"
 
         print_once(f"driver_stats_{name}", msg)

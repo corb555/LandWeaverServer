@@ -3,8 +3,6 @@ from typing import Optional
 
 import numpy as np
 
-from ThematicRender.settings import _BlendSpec
-
 ERR_PREFIX = "❌ Error: Blend Pipeline - "
 
 # Output tiling defaults
@@ -13,7 +11,7 @@ ALPHA_DENOM = 255.0
 
 
 def _validate_factor(
-        factor: Optional[np.ndarray], context: str, spec: "_BlendSpec",
+        factor: Optional[np.ndarray], context: str, spec,
         factors: Optional[dict[str, np.ndarray]] = None, ) -> np.ndarray:
     if factor is not None:
         return factor
@@ -51,6 +49,7 @@ def apply_factor_jitter(
     envelope = np.power(4.0 * t * (1.0 - t), atten_power)
 
     return np.clip(t + (noise * amplitude * envelope), 0.0, 1.0)
+
 
 def _onoff(v: bool) -> str:
     """Render a boolean as a compact CLI indicator.
@@ -133,14 +132,20 @@ class GenMarkdown:
 # Globally track seen message IDs
 _SEEN_MSGS = set()
 
+
 def print_once(msg_id: str, *args, **kwargs):
     """Prints a message only the first time a specific msg_id is encountered."""
     if msg_id not in _SEEN_MSGS:
         print(*args, **kwargs)
         _SEEN_MSGS.add(msg_id)
 
+
 def stats_once(tag, a):
-    print_once(tag, f"{tag} shape={a.shape} min={float(a.min()):.4f} max={float(a.max()):.4f} mean={float(a.mean()):.4f}")
+    print_once(
+        tag,
+        f"{tag} shape={a.shape} min={float(a.min()):.4f} max={float(a.max()):.4f} mean="
+        f"{float(a.mean()):.4f}"
+        )
 
 
 def reset_print_once():

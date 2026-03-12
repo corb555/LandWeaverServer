@@ -1,13 +1,14 @@
 import sys
+
 import numpy as np
-from scipy.ndimage import gaussian_filter
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QSlider, QGroupBox, QFormLayout)
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                               QLineEdit, QSlider, QGroupBox, QFormLayout)
+from scipy.ndimage import gaussian_filter
+
 
 def generate_preview_noise(shape, sigmas, weights, stretch, seed):
-    """The same logic from your pipeline, simplified for preview speed."""
     np.random.seed(seed)
     # Start with base white noise
     res = np.random.standard_normal(shape).astype(np.float32)
@@ -28,6 +29,7 @@ def generate_preview_noise(shape, sigmas, weights, stretch, seed):
     # Normalize 0..1
     c_min, c_max = composite.min(), composite.max()
     return (composite - c_min) / (c_max - c_min + 1e-6)
+
 
 class NoiseEditor(QMainWindow):
     def __init__(self):
@@ -130,7 +132,7 @@ class NoiseEditor(QMainWindow):
             self.brightness = self.bright_sld.value() / 100.0
             self.update_preview()
         except:
-            pass # Ignore malformed input during typing
+            pass  # Ignore malformed input during typing
 
     def update_preview(self):
         # Generate 512x512 noise
@@ -147,7 +149,10 @@ class NoiseEditor(QMainWindow):
 
         # Display
         pixmap = QPixmap.fromImage(qimg)
-        self.preview_label.setPixmap(pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.preview_label.setPixmap(
+            pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -1,6 +1,6 @@
-
+import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional, Iterable,  Final
+from typing import Dict, Any, Optional, Iterable, Final
 
 import numpy as np
 from scipy.interpolate import interp1d
@@ -8,13 +8,15 @@ from scipy.interpolate import interp1d
 from ThematicRender.color_config import ColorConfig
 from ThematicRender.color_ramp_hsv import get_ramp_from_yml
 from ThematicRender.config_mgr import ConfigMgr
+from ThematicRender.ipc_packets import Window
 from ThematicRender.keys import RequiredResources, SurfaceKey, FileKey, DriverKey
-from ThematicRender.noise_registry import NoiseRegistry
+from ThematicRender.noise_library import NoiseLibrary
 from ThematicRender.surface_library import SURFACE_PROVIDER_REGISTRY, MODIFIER_REGISTRY
-from ThematicRender.ipc_blocks import Window
 
+# surface_engine.py
 EXPECTED_BANDS = 3
 OPAQUE_ALPHA: Final[int] = 255
+
 
 def strip_alpha_or_fail(colors: np.ndarray, *, context: str) -> np.ndarray:
     """Normalize a ramp color table to RGB."""
@@ -33,6 +35,7 @@ def strip_alpha_or_fail(colors: np.ndarray, *, context: str) -> np.ndarray:
         )
     return colors[:, :3]
 
+
 class SurfaceEngine:
     def __init__(self, cfg: ConfigMgr):
         self.cfg = cfg
@@ -46,92 +49,100 @@ class SurfaceEngine:
         from ThematicRender.settings import SURFACE_SPECS
         self.spec_registry = {s.key: s for s in SURFACE_SPECS}
 
+        # --- DETERMINISTIC OFFSET CACHE ---
+        # We calculate this once. Every worker process will inherit
+        # these exact values.
+        self._offset_cache: Dict[SurfaceKey, int] = {}
+        for skey in self.spec_registry.keys():
+            seed_bytes = skey.encode('utf-8')
+            stable_hash = hashlib.md5(seed_bytes).hexdigest()
+            # Convert to an int and store it
+            self._offset_cache[skey] = int(stable_hash[:8], 16) % 1000
+
     def generate_surface_blocks(
-            self, val_2d: dict, vld_2d: dict, factors_2d: dict,
-            style_engine: Any, manifest: Iterable[SurfaceKey],
-            noises: NoiseRegistry, window: Window, anchor_key: DriverKey
+            self, data_2d: dict, masks_2d: dict, factors_2d: dict, style_engine: Any,
+            surface_inputs: Iterable[SurfaceKey], noises: NoiseLibrary, window: Window,
+            anchor_key: DriverKey
     ) -> Dict[SurfaceKey, np.ndarray]:
         """
-        Synthesizes surface blocks following the 2D Firewall Contract.
-        Returns a dict of (H, W, 3) float32 arrays.
+        Synthesizes the required RGB surfaces for the current tile.
+        The comp engine will use comp_ops and factors to combine these into the final result
         """
-        # 1. Determine Master Geometry from the 2D anchor
-        anchor_data = val_2d.get(anchor_key)
+        # Establish master geometry from the anchor
+        anchor_data = data_2d.get(anchor_key)
         if anchor_data is None:
-            raise KeyError(f"Surface Engine: Anchor '{anchor_key}' not found in val_2d.")
+            raise KeyError(f"Surface Engine: Anchor '{anchor_key.value}' not found in data_2d.")
 
         target_h, target_w = anchor_data.shape[:2]
         self.target_shape = (target_h, target_w)
 
-        res = {}
-        for skey in manifest:
-            spec = self.spec_registry.get(skey)
-            if not spec:
-                continue
+        rendered_surfaces = {}
+        for srf_key in surface_inputs:
+            spec = self.spec_registry.get(srf_key)
+            if spec is None:
+                available = list(self.spec_registry.keys())
+                raise KeyError(
+                    f"Surface Engine: Required surface '{srf_key.value}' not found in registry. "
+                    f"Check your SURFACE_SPECS definition. Available: {available}"
+                )
 
             provider_fn = SURFACE_PROVIDER_REGISTRY.get(spec.provider_id)
             if not provider_fn:
-                raise ValueError(f"Unknown provider '{spec.provider_id}' for surface {skey}")
+                available = list(SURFACE_PROVIDER_REGISTRY.keys())
+                raise ValueError(f"Unknown provider '{spec.provider_id}' for surface {srf_key}. Available: {available}")
 
             try:
-                # --- STAGE 1: CREATION ---
-                # Providers receive clean 2D dicts.
-                # Contract: returns (H, W, 3) float32.
-                block = provider_fn(self, spec, val_2d, vld_2d, factors_2d, style_engine)
+                # --- STAGE 1: SYNTHESIS ---
+                # Generate the base RGB block from the provider (Ramp/Style/etc)
+                block = provider_fn(self, spec, data_2d, masks_2d, factors_2d, style_engine)
 
+                # --- STAGE 2: MODIFICATION ---
+                # Apply procedural textures if defined in config
+                if spec.modifiers:
+                    block = self._apply_modifiers(srf_key, spec, block, noises, window)
+
+                # Validation and storage
                 if block.shape != (target_h, target_w, 3):
-                    raise ValueError(
-                        f"Contract Violation in {skey}: Expected ({target_h}, {target_w}, 3), "
-                        f"got {block.shape}"
-                    )
-                res[skey] = block
+                    raise ValueError(f"Shape mismatch in {srf_key.value}")
+
+                rendered_surfaces[srf_key] = block
 
             except Exception as e:
-                print(f"\n❌ Surface Engine Error: [{skey.value}]")
+                print(f"\n❌ Surface Engine Error: [{srf_key.value}]")
                 raise e
 
-        # --- STAGE 2: MODIFICATION ---
-        # Apply the chain of modifiers (Mottle, etc)
-        res = self.apply_surface_modifiers(res, manifest, noises, window)
+        return rendered_surfaces
 
-        return res
+    def _apply_modifiers(
+            self, srf_key: SurfaceKey, spec: Any, img_block: np.ndarray,
+            noises: NoiseLibrary, window: Window
+    ) -> np.ndarray:
+        """
+        Applies a sequence of transformations to a single RGB block.
+        """
+        from ThematicRender.settings import SURFACE_MODIFIER_SPECS
 
-    def apply_surface_modifiers(
-            self, surface_blocks: Dict[SurfaceKey, np.ndarray], manifest: Iterable[SurfaceKey],
-            noises: NoiseRegistry, window: Window
-    ) -> Dict[SurfaceKey, np.ndarray]:
-        """Executes the modifier chain for each surface using SHM-safe noise lookup."""
-        from ThematicRender.settings import SURFACE_MODIFIER_PROFILES
+        for mod_cfg in spec.modifiers:
+            mod_id = mod_cfg.get("id")
+            profile_id = mod_cfg.get("profile_id")
 
-        for skey in manifest:
-            spec = self.spec_registry.get(skey)
-            if not spec or not spec.modifiers:
+            mod_fn = MODIFIER_REGISTRY.get(mod_id)
+            profile = SURFACE_MODIFIER_SPECS.get(profile_id)
+
+            if not mod_fn or not profile:
                 continue
 
-            for mod_cfg in spec.modifiers:
-                mod_id = mod_cfg.get("id")
-                profile_id = mod_cfg.get("profile_id")
+            # Identify noise source and fetch deterministic spatial offset
+            noise_provider = noises.get(profile.noise_id)
+            offset = self._offset_cache.get(srf_key, 0)
 
-                mod_fn = MODIFIER_REGISTRY.get(mod_id)
-                profile = SURFACE_MODIFIER_PROFILES.get(profile_id)
+            # Sample noise using global coordinates (prevents tile seams)
+            noise_tile = noise_provider.window_noise(window, row_off=offset, col_off=offset)
 
-                if not mod_fn or not profile:
-                    continue
+            # Transform the block
+            img_block = mod_fn(img_block, noise_tile, profile)
 
-                # Coordinate Alignment: Logic handled in render_task compute_window logic
-                # We sample noise at the specific size of the current surface block
-                img_block = surface_blocks[skey]
-                h_buf, w_buf = img_block.shape[:2]
-
-                # Fetch Noise (Contract: window_noise returns H,W,1)
-                noise_provider = noises.get(profile.noise_id)
-                offset = hash(skey.value) % 1000
-                noise_tile = noise_provider.window_noise(window, row_off=offset, col_off=offset)
-
-                # Library math: (H,W,3) op (H,W,1)
-                surface_blocks[skey] = mod_fn(img_block, noise_tile, profile)
-
-        return surface_blocks
+        return img_block
 
     def load_surface_ramps(self, resources: RequiredResources, output_dir: Optional[str] = None):
         """Initializes interpolators for all ramp-based surfaces."""
@@ -144,7 +155,6 @@ class SurfaceEngine:
 
         print("🔓 Initializing Surface Ramps...")
 
-        # 1. Resolve ramps_yml path using new ConfigMgr path() accessor
         ramps_yml_path = self.cfg.path(FileKey.RAMPS_YML.value)
 
         # 2. Process Primary Pivot first (derived ramps depend on this)
@@ -161,7 +171,9 @@ class SurfaceEngine:
             spec = self.spec_registry.get(skey)
             if spec is None:
                 available = list(self.spec_registry.keys())
-                raise ValueError(f"Missing SurfaceSpec for required input '{skey}'. Available: {available}")
+                raise ValueError(
+                    f"Missing SurfaceSpec for required input '{skey}'. Available: {available}"
+                    )
 
             # Only 'ramp' providers need a scipy interpolator
             if spec.provider_id != "ramp":
@@ -178,19 +190,17 @@ class SurfaceEngine:
 
     def _load_and_interpolate(self, skey, base_path, ramps_yml_path, out_dir):
         """Helper to resolve a ramp file and build the scipy interpolator."""
-        spec = self.spec_registry[skey]
         yaml_name = f"{skey.value}_color_ramp"
 
         mode, ramp_path = self._resolve_ramp_file(
-            surface_key=skey,
-            yaml_name=yaml_name,
-            base_ramp_path=base_path,
-            ramp_yml_path=ramps_yml_path,
-            output_dir=out_dir
+            surface_key=skey, yaml_name=yaml_name, base_ramp_path=base_path,
+            ramp_yml_path=ramps_yml_path, output_dir=out_dir
         )
 
         if ramp_path is None or not ramp_path.exists():
-            raise FileNotFoundError(f"Ramp file for {skey.value} could not be resolved at {ramp_path}")
+            raise FileNotFoundError(
+                f"Ramp file for {skey.value} could not be resolved at {ramp_path}"
+                )
 
         print(f"   🔹 {skey.value.ljust(15)} <- {ramp_path.name}")
 
@@ -201,7 +211,9 @@ class SurfaceEngine:
         self.surfaces[skey] = interp1d(z, c_rgb, axis=0, fill_value="extrapolate", kind="linear")
         self.ramp_files[skey.value] = ramp_path
 
-    def _resolve_ramp_file(self, *, surface_key, yaml_name, base_ramp_path, ramp_yml_path, output_dir):
+    def _resolve_ramp_file(
+            self, *, surface_key, yaml_name, base_ramp_path, ramp_yml_path, output_dir
+            ):
         """Resolves path using ConfigMgr or derives a new one using ramps_yml."""
         # Check ConfigMgr for an explicit file path provided by user
         explicit_path = self.cfg.path(surface_key.value)
@@ -211,15 +223,15 @@ class SurfaceEngine:
 
         # Otherwise, attempt to derive using the color_ramp_hsv logic
         if ramp_yml_path is None:
-            raise ValueError(f"Cannot derive ramp for '{surface_key}': ramps_yml path not provided.")
+            raise ValueError(
+                f"Cannot derive ramp for '{surface_key}': ramps_yml path not provided."
+                )
 
         out_path = output_dir / f"gen_{yaml_name}.txt"
         try:
             mode, fname = get_ramp_from_yml(
-                ramp_name=yaml_name,
-                ramps_yml_settings=str(ramp_yml_path),
-                base_ramp=str(base_ramp_path) if base_ramp_path else None,
-                output_path=str(out_path)
+                ramp_name=yaml_name, ramps_yml_settings=str(ramp_yml_path),
+                base_ramp=str(base_ramp_path) if base_ramp_path else None, output_path=str(out_path)
             )
             return mode, Path(fname)
         except Exception as e:
