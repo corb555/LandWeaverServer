@@ -1,319 +1,641 @@
 # pipeline_engine.py
-from contextlib import ExitStack
-import multiprocessing as mp
-import os
+from dataclasses import dataclass, field
+from datetime import datetime
+import hashlib
+import json
 from pathlib import Path
+from queue import Empty
 import time
-import traceback
-from typing import Dict, Any
+from typing import List, Callable, Optional, TypeAlias, Tuple, Counter
 
-import numpy as np
-import rasterio
 from rasterio.windows import Window
-from tqdm import tqdm
-
+from ThematicRender.command_proxy import CommandProxy
 from ThematicRender.compositing_engine import CompositingEngine
-from ThematicRender.compositing_library import COMPOSITING_REGISTRY
-from ThematicRender.config_mgr import ConfigMgr, derive_resources, analyze_pipeline
+from ThematicRender.engine_resources import EngineResources
 from ThematicRender.factor_engine import FactorEngine
-from ThematicRender.ipc_packets import PoolSpec, SharedMemoryPool
-from ThematicRender.keys import DriverKey
+from ThematicRender.io_manager import IOManager, IOSystem
+from ThematicRender.ipc_packets import Envelope, Op, JobDonePacket, ErrorPacket, BlockLoadedPacket, \
+    TileWrittenPacket
+from ThematicRender.job_control import JobControl
 from ThematicRender.noise_library import NoiseLibrary
-from ThematicRender.pipeline_tasks import ReaderContext, WorkerContext, WriterContext, read_task, \
-    render_task, write_task, writer_worker_loop, render_worker_loop
-from ThematicRender.raster_manager import RasterManager
-from ThematicRender.settings import FACTOR_SPECS, SURFACE_SPECS
+from ThematicRender.reader_task import ReaderContext
+from ThematicRender.render_config import derive_resources, JobManifest, RenderConfig
+from ThematicRender.render_task import WorkerContext
 from ThematicRender.surface_engine import SurfaceEngine
+from ThematicRender.system_config import SystemConfig
+from ThematicRender.tile_dispatcher import TileDispatcher
+from ThematicRender.utils import assert_pickle
+from ThematicRender.writer_task import WriterContext
+
+EnvelopeHandler: TypeAlias = Callable[[Envelope], None]
+
 from ThematicRender.theme_registry import ThemeRegistry
-from ThematicRender.utils import TimerStats, GenMarkdown
+
+
+def dbg(msg, id):
+    pass
 
 
 # pipeline_engine.py
 class PipelineEngine:
-    def __init__(
-            self, cfg: ConfigMgr, pipeline: list, percent: Any, row: Any, col: Any,
-            multitthread: bool
-    ) -> None:
-        self.pool_map = None
-        self.multitthread = multitthread
-        self.cfg = cfg
-        self.tmr = TimerStats()
+    def __init__(self, system_yml_path: Path):
+        self.proxy = None
+        self.engine_cfg = SystemConfig.load_engine_specs(system_yml_path)
+        self.eng_resources: EngineResources = EngineResources(self.engine_cfg)
 
-        # 1. Initialize Engines
-        self.surface_eng = SurfaceEngine(cfg)
-        self.themes = ThemeRegistry(cfg)
-        self.themes.load_metadata()
-        self.compositor = CompositingEngine(self.tmr)
-
-        # 2. Map Resources
-        self.resources = derive_resources(
-            cfg=cfg, pipeline=pipeline, factor_specs=FACTOR_SPECS, surface_specs=SURFACE_SPECS
+        self.io_system: IOSystem = IOSystem()
+        self.dispatcher = TileDispatcher(resources=self.eng_resources, max_in_flight=10)
+        self.orchestrator = PipelineOrchestrator(
+            self.eng_resources, self.io_system, self.dispatcher
         )
 
-        # 3. Initialize Shared Resources
-        self.noise_registry = NoiseLibrary(cfg, self.resources.noise_profiles)
-        self.factor_eng = FactorEngine(
-            cfg=self.cfg, themes=self.themes, noise_registry=self.noise_registry,
-            factor_specs=FACTOR_SPECS, resources=self.resources, timer=self.tmr
+    def start(self):
+        self.eng_resources.setup_engine()
+        self.proxy = CommandProxy(
+            socket_path=self.engine_cfg.get("system.socket_path"),
+            status_q=self.eng_resources.status_q, response_q=self.eng_resources.response_q
         )
-        self.pipeline = pipeline
+        self.proxy.start()
+        self.orchestrator.run_loop()
 
-        # 4. Handle Preview Params
-        p = float(percent) if percent is not None else 0.0
-        self.percent = p if 0.0 < p < 1.0 else 0.0
-        self.row = float(row) if row is not None else 0.5
-        self.col = float(col) if col is not None else 0.5
 
-    def process_rasters(self) -> None:
-        # Simple stats accumulator
-        stats = {
-            "read": 0.0, "render": 0.0, "write": 0.0, "flush": 0.0, "init": 0.0, "cleanup": 0.0,
-            "count": 0
+class PipelineOrchestrator:
+    def __init__(self, eng_resources, io_system, dispatcher):
+        self.eng_resources = eng_resources
+        self.resolver: TaskResolver = TaskResolver()
+        self.io_system = io_system
+        self.dispatcher = dispatcher
+        self.stats = JobTelemetry()
+        self.last_progress_pulse = 0.0
+        self.previous_ts = 0
+
+        # Render engines
+        self.factor_eng = None
+        self.surface_eng = None
+        self.factory = None
+
+        self.pending_jobs: List[dict] = []
+        self.job_control: JobControl = JobControl()
+
+        # Command dispatch table
+        self._dispatch: dict[Op, EnvelopeHandler] = {
+            Op.JOB_REQUEST: self._handle_job_request, Op.SHUTDOWN: self._handle_shutdown,
+            Op.BLOCK_LOADED: self._handle_block_loaded, Op.TILE_WRITTEN: self._handle_tile_written,
+            Op.TILES_FINALIZED: self._handle_tiles_finalized, Op.ERROR: self._handle_error,
         }
-        total_start = time.perf_counter()
-        multiprocess = True
 
-        with ExitStack() as stack:
-            out_path = self.cfg.path("output")
+        self.running = True
 
-            # 1. Define Pool Specs (256x256 tiles, 3 bands for RGB)
-            out_spec = PoolSpec(
-                data_shape=(3, 256, 256),  # RGB
-                data_dtype=np.dtype(np.uint8), mask_shape=(1, 256, 256),  # Alpha/Mask
-                mask_dtype=np.dtype(np.float32)
+    def run_loop(self) -> None:
+        while self.running:
+            try:
+                # Timeout allows us to pulse progress even if no tiles are finishing
+                envelope: Envelope = self.eng_resources.status_q.get(timeout=0.05)
+            except Empty:
+                self._pulse_client_progress() # Pulse during idle/stall
+                continue
+            except KeyboardInterrupt:
+                break
+
+            self.update_telemetry(envelope.op)
+
+            # Dispatch envelope to a handler
+            self._dispatch.get(envelope.op, self._handle_unknown_op)(envelope)
+
+            # Pulse during active processing
+            self._pulse_client_progress()
+
+    def _handle_job_request(self, envelope: Envelope) -> None:
+        """Queue a new job request and start it if no job is active."""
+        data = envelope.payload
+
+        # Queue job
+        self.pending_jobs.append(data)
+
+        # Immediately run it if we're not busy
+        if not self.job_control.busy:
+            self._start_next_job()
+
+    def showtime(self, msg):
+        wall_start = datetime.now()
+        start_ts = wall_start.strftime("%H:%M:%S.%f")[:-3]
+        if self.previous_ts == 0:
+            print(f"{start_ts} {msg}")
+        else:
+            print(f"{start_ts} {msg}. Elapsed: {wall_start - self.previous_ts}")
+        self.previous_ts = wall_start
+
+    def _start_next_job(self) -> bool:
+        """Start the next queued job, if any."""
+        if not self.pending_jobs: return False
+        json_job_req = self.pending_jobs.pop(0)
+
+        try:
+            # 1. Resolve request into a fully populated manifest
+            job_manifest = self.resolver.create_job_manifest(json_job_req)
+            self.showtime(f"START JOB {job_manifest.job_id}")
+            print(f"HASH STEP 2: hash added to job_manifest.resources.logic_hash={job_manifest.resources.logic_hash}")
+
+            # 5. Late-bind persistent logic engines
+            if self.factor_eng is None:
+                self._hydrate_logic(job_manifest.render_cfg, job_manifest.resources)
+                self.showtime("_hydrate_logic done")
+            else:
+                self.showtime("_hydrate_logic skipped")
+
+            self.factor_eng.cfg = job_manifest.render_cfg
+            self.surface_eng.cfg = job_manifest.render_cfg
+            self.theme_reg.load_metadata(job_manifest.render_cfg)
+            self.showtime("load_metadata done")
+
+            # 2. Clean up any stale temp output
+            self._unlink_file_if_exists(job_manifest.temp_out_path)
+
+            # 9. Initialize the physical temp output file (950x1197 for preview)
+            # We ignore the local windows returned here in favor of Global Windows.
+            self.io_system.initialize_physical_output(
+                job_manifest.temp_out_path, job_manifest.profile, )
+            self.showtime("initialize_physical_output done")
+
+            # 4. Generate Global Window List
+            # This ensures the Reader loads Yosemite pixels, not the top-left of the map.
+            win_list = self._generate_job_windows(job_manifest)
+            self.showtime("win_list done")
+
+            # 6. Build worker contexts
+            # This uses the ContextFactory to build Reader, Worker, and Writer data.
+            factory = ContextFactory(
+                self.factor_eng, self.surface_eng, themes=self.theme_reg,
+                compositor=self.compositor, noise_registry=self.noise_lib, )
+
+            reader_ctx, worker_ctx, writer_ctx = factory.sync_and_build(
+                job_manifest, self.eng_resources, )
+            self.showtime("sync_and_build done")
+
+            # 7. Create new job control with the global tile count
+            self.job_control = JobControl(
+                manifest=job_manifest, total_tiles=len(win_list), )
+
+            # 8. Publish job context for workers
+            self.eng_resources.update_context(
+                job_id=job_manifest.job_id, reader_data=reader_ctx, worker_data=worker_ctx,
+                writer_data=writer_ctx, )
+            self.showtime("update_context done")
+
+            # 9. Initialize dispatcher with GLOBAL windows and prime pipeline
+            self.dispatcher.initialize_job(job_manifest, win_list)
+            self.showtime("initialize_job done")
+
+            dispatch_results = self.dispatcher.prime_pipeline(job_manifest.job_id)
+
+            for result in dispatch_results:
+                for env in result.read_packets:
+                    self.send_to_worker("read_q", env)
+
+                if result.render_packet is not None:
+                    self.send_to_worker(
+                        "work_q", Envelope(op=Op.RENDER_TILE, payload=result.render_packet), )
+
+            self.showtime("RENDERING")
+            return True
+
+        except MemoryError as exc:
+            print(f"❌ [Orchestrator] Failed to start render: {exc}")
+            self.job_control.clear_job()
+            return False
+
+    def _handle_tiles_finalized(self, envelope: Envelope) -> None:
+        """Publish the finalized temp file and notify the client."""
+        if self.job_control is None:
+            raise ValueError("[ORCHESTRATOR] Received TILES_FINALIZED but no job is active")
+
+        finalized_job_id = envelope.payload
+        if finalized_job_id != self.job_control.job_id:
+            raise ValueError(
+                f"[ORCHESTRATOR] Received TILES_FINALIZED for job '{finalized_job_id}', "
+                f"but active job is '{self.job_control.job_id}'"
             )
-            # Initialize the pool for the output buffers
-            output_pool = SharedMemoryPool(out_spec, slots=16, prefix="tr_output")
-            stack.callback(output_pool.cleanup)  # Ensure cleanup is registered immediately
 
-            with RasterManager(self.cfg, self.resources.drivers, self.resources.anchor_key) as io:
-                # 2. PREVIEW LOGIC FIRST
-                # (Calculates the final dimensions and profile BEFORE creating the file)
-                write_offset_row = 0
-                write_offset_col = 0
-                envelope = None
-                profile = self._build_output_profile(io)
+        try:
+            # Publish temp -> final atomically after writer flush/close completes
+            self.job_control.temp_out_path.replace(self.job_control.final_out_path)
+            #print(f"✅ [Orchestrator] Render complete for job: '{self.job_control.job_id}'")
+        except MemoryError as exc:
+            print(
+                f"❌ [Orchestrator] Failed to publish temp output "
+                f"'{self.job_control.temp_out_path}' -> '{self.job_control.final_out_path}': {exc}"
+            )
+            self._unlink_file_if_exists(self.job_control.temp_out_path)
+            self._send_to_client(
+                {
+                    "msg": "error", "job_id": self.job_control.job_id,
+                    "message": f"publish failure: {exc}",
+                }
+            )
+            self.job_control.clear_job()
+            self._start_next_job()
+            return
 
-                if 0.0 < self.percent < 1.0:
-                    envelope = self._calculate_preview_window(
-                        io.anchor_src, percent=self.percent, rel_x=self.col, rel_y=self.row
-                    )
-                    if envelope is not None:
-                        profile.update(
-                            {
-                                "width": int(envelope.width), "height": int(envelope.height),
-                                "transform": io.anchor_src.window_transform(envelope),
-                            }
-                        )
-                        write_offset_row = int(envelope.row_off)
-                        write_offset_col = int(envelope.col_off)
+        duration = self.job_control.elapsed
+        print(
+            f"✅ [Orchestrator] RENDER COMPLETE FOR JOB '{self.job_control.job_id}' "
+            f"| Tiles: {self.job_control.total_tiles} "
+            f"| Time: {duration:.3f}s "
+            f"({(duration / self.job_control.total_tiles) * 1000:.1f}ms/tile)"
+        )
 
-                # 3. INITIALIZE THE FILE AND CLOSE IT IMMEDIATELY
-                # This satisfies GDAL's "format recognized" check for the later r+ open
-                print(f"🏗️ Initializing output: {out_path.name}")
-                with rasterio.open(out_path, "w", **profile) as init_dst:
-                    pass
+        self._send_to_client(
+            {
+                "msg": "complete", "job_id": self.job_control.job_id,
+                "path": str(self.job_control.final_out_path),
+            }
+        )
+        self.showtime(f"JOB {self.job_control.job_id} COMPLETE")
 
-                # 4. PREPARE THE WINDOWS & POOL MAP
-                # We open in "r" briefly to inspect the block structure
-                with rasterio.open(out_path, "r") as reader_dst:
-                    dst_windows = [w for _, w in reader_dst.block_windows(1)]
-                    self.pool_map = self._create_pool_map(io=io, dst=reader_dst)
-                    for pool in self.pool_map.values():
-                        stack.callback(pool.cleanup)
+        self.job_control.clear_job()
+        self._start_next_job()
 
-                # 5. TRANSLATE WINDOWS
+    def _generate_job_windows(self, manifest: JobManifest) -> List[Window]:
+        """Calculates global windows using a uniform 256x256 grid."""
+
+        if manifest.envelope is not None:
+            # Use the existing preview envelope
+            target_env = manifest.envelope
+        else:
+            # FULL RENDER: Create a virtual envelope covering the entire anchor
+            meta = manifest.driver_metadata[manifest.resources.anchor_key]
+            target_env = Window(0, 0, meta['width'], meta['height'])
+
+        tiles = []
+        # Step by 256 pixels across the target area
+        for r in range(int(target_env.row_off), int(target_env.row_off + target_env.height), 256):
+            for c in range(
+                    int(target_env.col_off), int(target_env.col_off + target_env.width), 256
+                    ):
+                # Calculate width/height, ensuring we don't go out of bounds
+                w = min(256, int(target_env.col_off + target_env.width) - c)
+                h = min(256, int(target_env.row_off + target_env.height) - r)
+                tiles.append(Window(c, r, w, h))
+
+        return tiles
+
+    def _handle_block_loaded(self, envelope: Envelope) -> None:
+        """Advance a tile after one block finishes loading."""
+        packet: BlockLoadedPacket = envelope.payload
+        if not self.valid_job_id(packet.job_id):
+            return
+
+        render_packet = self.dispatcher.on_driver_block_loaded(
+            packet.job_id, packet.tile_id, packet.read_duration, )
+        if render_packet is not None:
+            self.send_to_worker(
+                "work_q", Envelope(op=Op.RENDER_TILE, payload=render_packet), )
+
+    def _handle_tile_written(self, envelope: Envelope) -> None:
+        """Release tile resources via the dispatcher and advance job progress."""
+        packet: TileWrittenPacket = envelope.payload
+        if not self.valid_job_id(packet.job_id):
+            return
+        if True:
+            dbg(
+                f" >>> [RECV] Q: {"status":8} | OP: {envelope.op.name:15} | TILE: "
+                f"{packet.tile_id:<5} | "
+                f"JOB: {packet.job_id}"
+                f" [STATE] In-Flight: {"":<3} | Pending Jobs: {"":<2} | "
+                f"Progress: ", packet.tile_id
+            )
+
+        if not self.dispatcher.on_tile_written(packet.tile_id):
+            return
+
+        is_complete = self.job_control.mark_tile_written()
+        if is_complete:
+            self._finalize_job()
+            return
+
+        dispatch_result = self.dispatcher.dispatch_next_tile(self.job_control.job_id)
+        if dispatch_result.tile_id is None:
+            return
+
+        for env in dispatch_result.read_packets:
+            self.send_to_worker("read_q", env)
+
+        if dispatch_result.render_packet is not None:
+            self.send_to_worker(
+                "work_q", Envelope(op=Op.RENDER_TILE, payload=dispatch_result.render_packet), )
+
+    def _handle_unknown_op(self, envelope: Envelope) -> None:
+        """Fallback handler for unregistered OpCodes."""
+        self.stats.unknown_ops += 1
+        print(f"⚠️ [Orchestrator] ERROR: Unknown OpCode: {envelope.op}")
+        self._handle_shutdown(envelope)
+
+    def valid_job_id(self, job_id):
+        valid = job_id == self.job_control.job_id
+        if not valid:
+            self.stats.bad_job_ids += 1
+        return valid
+
+    def _handle_error(self, envelope: Envelope) -> None:
+        """Handle a pipeline error, cancel output, and notify the client."""
+
+        # TODO: This intentionally does NOT start the next queued job after an error.
+        # During debugging, the daemon will stop progressing so the failure state
+        # can be inspected.
+
+        payload: ErrorPacket = envelope.payload
+        job_id = payload.job_id or self.job_control.job_id
+
+        print(
+            f"❌ [Orchestrator] {payload.stage} error "
+            f"on tile {payload.tile_id} for job '{job_id}': {payload.message}"
+        )
+
+        if self.job_control.job_id == payload.job_id:
+            packet = JobDonePacket(job_id=self.job_control.job_id)
+            self.send_to_worker('writer_q', Envelope(op=Op.JOB_CANCEL, payload=packet))
+            self.dispatcher.abort_job()
+            self._unlink_file_if_exists(self.job_control.temp_out_path)
+            self.job_control.clear_job()
+
+        self._send_to_client(
+            {
+                "msg": "error", "job_id": job_id,
+                "message": f"{payload.stage} failure: {payload.message}",
+            }
+        )
+
+    def _handle_shutdown(self, _envelope: Envelope) -> None:
+        """Stop the event loop and discard any active temp output."""
+        if self.job_control.busy:
+            packet = JobDonePacket(job_id=self.job_control.job_id)
+            self.send_to_worker('writer_q', Envelope(op=Op.SHUTDOWN, payload=packet))
+            self._unlink_file_if_exists(self.job_control.temp_out_path)
+
+        self.running = False
+        print("🛑 [Orchestrator] Shutting Down.")
+
+    def send_to_worker(self, queue_attr: str, envelope: Envelope) -> None:
+        """
+        Centrally managed 'put' for all worker queues with state logging.
+        queue_attr: 'read_q', 'work_q', or 'writer_q'
+        """
+        # 1.  Queue Put
+        queue = getattr(self.eng_resources, queue_attr)
+        queue.put(envelope)
+
+        # 2. Update Stats
+        payload = envelope.payload
+        tile_id = getattr(payload, 'tile_id', '-')
+        job_id = getattr(payload, 'job_id', self.job_control.job_id)
+
+        # 3. Capture Current Orchestrator State
+        pending_jobs = len(self.pending_jobs)
+        in_flight = len(self.dispatcher.active_tiles)
+
+        prog_str = f"{self.job_control.tiles_written}/{self.job_control.total_tiles}"
+
+        # 4. Print Multi-line Visibility Block
+        if True:
+            dbg(
+                f" >>> [SEND] Q: {queue_attr:8} | OP: {envelope.op.name:15} | TILE: {tile_id:<5} | "
+                f"JOB: {job_id}"
+                f" [STATE] In-Flight: {in_flight:<3} | Pending Jobs: {pending_jobs:<2} | "
+                f"Progress: {prog_str}", tile_id
+            )
+
+    @staticmethod
+    def _build_temp_output_path(final_path: Path, job_id: str) -> Path:
+        """Return a temp output path in the same directory as the final output."""
+        return final_path.with_name(f"{final_path.stem}.{job_id}.tmp{final_path.suffix}")
+
+    @staticmethod
+    def _unlink_file_if_exists(path: Optional[Path]) -> None:
+        """Best-effort unlink."""
+        if path is None:
+            return
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception as exc:
+            print(f"⚠️ [Orchestrator] Failed to unlink temp file '{path}': {exc}")
+
+    def _hydrate_logic(self, render_cfg, resources) -> None:
+
+        # this is  Render specific, not Pipeline
+        """Initialize and immediately validate the persistent math engines."""
+        self.noise_lib = NoiseLibrary(render_cfg, profiles=render_cfg.noises, create_shm=True)
+        self.eng_resources.manage_noise_library(self.noise_lib)
+        self.theme_reg = ThemeRegistry(render_cfg)
+
+        # Create the engine
+        self.factor_eng = FactorEngine(
+            render_cfg, self.theme_reg, self.noise_lib, render_cfg.factors, resources, None
+        )
+
+        # --- EARLY SANITY CHECK ---
+        # If the engine holds a Queue, it will fail here instantly.
+        #assert_pickle(self.factor_eng, "FactorEngine (Initial Hydration)")
+
+        self.surface_eng = SurfaceEngine(render_cfg)
+        #assert_pickle(self.surface_eng, "SurfaceEngine (Initial Hydration)")
+
+        self.compositor = CompositingEngine()
+
+    def _finalize_job(self) -> None:
+        """Begin successful job finalization by asking the writer to flush and close."""
+        if self.job_control is None:
+            raise ValueError("[ORCHESTRATOR] Finalize Job but no job is active")
+
+        packet = JobDonePacket(job_id=self.job_control.job_id)
+        self.send_to_worker('writer_q', Envelope(op=Op.JOB_DONE, payload=packet))
+
+    def _send_to_client(self, payload: dict) -> None:
+        """Send a response payload back to the socket proxy."""
+        self.eng_resources.response_q.put(payload)
+
+    def update_telemetry(self, op):
+        self.stats.last_op = op
+        self.stats.op_counts[op] += 1
+        self.stats.print_report(orchestrator=self, interval=1.0)
+
+    def _pulse_client_progress(self) -> None:
+        """Send a progress heartbeat to the client if a job is active."""
+        if not self.job_control.busy:
+            return
+
+        now = time.perf_counter()
+        if now - self.last_progress_pulse < 5.0:
+            return
+
+        job = self.job_control
+        # Calculate integer percentage
+        pct = int((job.tiles_written / job.total_tiles) * 100) if job.total_tiles > 0 else 0
+
+        self._send_to_client({
+            "msg": "progress",
+            "request_id": job.job_id,
+            "progress": pct,
+            "message": ""
+        })
+        self.last_progress_pulse = now
+
+        # print(f"Orch Dispatch MSG OP: {op}")
+
+
+class TaskResolver:
+    """Resolve incoming job requests into fully validated render manifests."""
+
+    def create_job_manifest(self, json_request: dict) -> JobManifest:
+        # 1. Extract parameters
+        job_id = json_request.get("job_id")
+        if not job_id:
+            raise ValueError("Job request is missing required 'job_id'")
+
+        params = json_request.get("params", {})
+        config_path = Path(params.get("config_path")).expanduser()
+        build_dir = Path(params.get("build_dir", "build")).expanduser()
+        prefix = params.get("prefix", "")
+        output_file = params.get("output_file", "output.tif")
+
+        print(f"\n\nNEW JOB REQUEST - create_job_manifest for Job '{job_id}'")
+
+        # 2. Load and resolve render configuration
+        print("LOADING RENDER CONFIG")
+        render_cfg = RenderConfig.load(config_path=config_path)
+        render_cfg.resolve_paths(prefix=prefix, build_dir=build_dir, output_file=output_file)
+
+        # 3. GENERATE HASHES for Hot-Reloading
+
+        # LOGIC HASH: Representing Factor math, logic parameters, and driver specs
+        logic_data = {
+            "factors": render_cfg.raw_defs.get("factors", {}),
+            "factor_specs": render_cfg.raw_defs.get("factor_specs", {}),
+            "drivers": render_cfg.raw_defs.get("drivers", {}),
+            "driver_specs": render_cfg.raw_defs.get("driver_specs", {})
+        }
+        logic_hash = self.generate_content_hash(logic_data)
+
+        # STYLE HASH: Representing Surfaces and the Blend Pipeline
+        style_data = {
+            "surfaces": render_cfg.raw_defs.get("surfaces", {}),
+            "pipeline": render_cfg.raw_defs.get("pipeline", []),
+            "theme_smoothing": render_cfg.raw_defs.get("theme_smoothing_specs", {}),
+            "surface_modifier_specs": render_cfg.raw_defs.get("surface_modifier_specs", {}),
+        }
+        style_hash = self.generate_content_hash(style_data)
+
+        # DEBUG: Look at the actual value in the Orchestrator
+        water_logic = render_cfg.raw_defs.get('drivers', {}).get('water', {})
+        current_opacity = water_logic.get('max_opacity')
+
+        print(f"DEBUG [Resolver] YAML Load - Water Opacity: {current_opacity}")
+        print(f"[Resolver] **HASH STEP 1** Generated Logic Hash: {logic_hash[:8]}")
+
+        # TODO noise_profiles is not hashed
+
+        # 4. Resolve Resources and Geography
+        resources = derive_resources(render_cfg=render_cfg)
+
+        # Resolve output paths
+        final_out_path = Path(render_cfg.files["output"])
+        temp_out_path = self.build_temp_output_path(final_out_path, job_id)
+        render_cfg.files["output"] = temp_out_path
+
+        # Metadata capture
+        percent = float(params.get("percent", 0.0))
+        row_focal = float(params.get("row", 0.0))
+        col_focal = float(params.get("col", 0.0))
+        envelope: Optional[Window] = None
+        write_offset = (0, 0)
+        driver_metadata = {}
+
+        with IOManager(render_cfg, resources.drivers, resources.anchor_key) as io:
+            # Geography Hash (based on paths and mtimes)
+            geography_hash = self.generate_region_hash(resources)
+            profile = self.build_output_profile(io)
+
+            for dkey in resources.drivers:
+                src = io.sources[dkey]
+                driver_metadata[dkey] = {"width": src.width, "height": src.height}
+
+            if 0.0 < percent < 1.0:
+                envelope = self.calculate_preview_window(
+                    io.anchor_src, percent=percent, rel_x=col_focal, rel_y=row_focal)
                 if envelope is not None:
-                    win_list = [Window(
-                        col_off=int(w.col_off) + write_offset_col,
-                        row_off=int(w.row_off) + write_offset_row, width=int(w.width),
-                        height=int(w.height)
-                    ) for w in dst_windows]
-                else:
-                    win_list = dst_windows
+                    profile.update({
+                        "width": int(envelope.width), "height": int(envelope.height),
+                        "transform": io.anchor_src.window_transform(envelope),
+                    })
+                    write_offset = (int(envelope.row_off), int(envelope.col_off))
 
-                # 6. BUILD CONTEXTS
-                reader_ctx = ReaderContext(io=io, pool_map=self.pool_map)
-                worker_ctx = WorkerContext(
-                    cfg=self.cfg, pool_map=self.pool_map, factors_engine=self.factor_eng,
-                    surfaces_engine=self.surface_eng, themes=self.themes,
-                    compositor=self.compositor, pipeline=self.pipeline,
-                    anchor_key=self.resources.anchor_key,
-                    surface_inputs=self.resources.surface_inputs, resources=self.resources,
-                    noise_registry=self.noise_registry, out_pool=output_pool
-                )
+        # 5. Add hashes
+        resources = resources.with_hashes(
+            geography_hash=geography_hash,
+            logic_hash=logic_hash,
+            style_hash=style_hash
+        )
 
-                writer_ctx = WriterContext(
-                    output_path=out_path, output_profile=profile, pool_map=self.pool_map,
-                    write_offset_row=write_offset_row, write_offset_col=write_offset_col,
-                    out_pool=output_pool  # Connect the output pool here
-                )
-                #  Generate the report in Main (where it only runs once)
-                report = analyze_pipeline(worker_ctx)
-                with open("pipeline_describe.md", "w") as f:
-                    f.write(report)
-
-                init_duration = time.perf_counter() - total_start
-                stats["init"] = init_duration
-
-                if multiprocess:
-                    # --- PHASE 3: MULTIPROCESSING ---
-                    print(
-                        f" Launching Pipeline [Multiprocessor: {os.cpu_count() - 1} render cores]"
-                        )
-
-                    # 1. Get the Spawn Context
-                    ctx_mp = mp.get_context('spawn')
-
-                    # 2. Setup Shared Queues
-                    work_queue = ctx_mp.Queue(maxsize=4)  # Small buffer for backpressure
-                    result_queue = ctx_mp.Queue()
-
-                    # 3. Start Dedicated Writer
-                    writer_p = ctx_mp.Process(
-                        target=writer_worker_loop, args=(result_queue, writer_ctx)
-                    )
-                    writer_p.start()
-
-                    # 4. Start Render Worker Pool
-                    # We save 1 core for the Reader/Main and 1 for the Writer
-                    num_workers = 3  # max(1, os.cpu_count() - 2)
-                    workers = []
-                    for i in range(num_workers):
-                        p = ctx_mp.Process(
-                            target=render_worker_loop, args=(work_queue, result_queue, worker_ctx)
-                        )
-                        p.start()
-                        workers.append(p)
-
-                    # 5. READER LOOP (Main Process)
-                    try:
-                        progress_bar = tqdm(win_list, desc="Rendering (MP)")
-                        for seq, window in enumerate(progress_bar):
-                            # This will naturally block if SHM slots are full
-                            work_packet = read_task(seq=seq, window=window, ctx=reader_ctx)
-
-                            # Push to workers
-                            work_queue.put(work_packet)
-
-                    finally:
-                        print("🛑 Shutting down workers...")
-                        # Send None to every worker to stop them
-                        for _ in workers: work_queue.put(None)
-                        for p in workers: p.join()
-
-                        # Send None to writer
-                        result_queue.put(None)
-                        writer_p.join()
-                # 7. PROCESSING
-                else:
-                    # ---  SINGLE THREADED ---
-                    debug_mode = False
-                    limit = 10
-                    if debug_mode:
-                        print(f"🔬 DEBUG MODE: Processing first {limit} blocks...")
-                        active_windows = win_list[:limit]
-                        iterable = enumerate(active_windows)
-                    else:
-                        active_windows = win_list
-                        iterable = enumerate(tqdm(active_windows, desc="Rendering (ST)"))
-
-                    for seq, window in iterable:
-                        work_packet = read_task(seq=seq, window=window, ctx=reader_ctx)
-                        stats["read"] += work_packet.read_duration
-
-                        result_packet = render_task(packet=work_packet, ctx=worker_ctx)
-                        stats["render"] += result_packet.render_duration
-
-                        stats["write"] += write_task(packet=result_packet, ctx=writer_ctx)
-                        stats["count"] += 1
-
-                    f_start = time.perf_counter()
-                    writer_ctx.close()
-                    stats["write"] += (time.perf_counter() - f_start)
-
-        # This is where the deferred write time actually happens
-        writer_ctx.close()
-        flush_duration = 0  # time.perf_counter() - flush_start
-        stats["flush"] = flush_duration
-        stats["write"] += flush_duration
-        print(f"\nDisk Flush:      {flush_duration:.2f}s")
-
-        total_elapsed = time.perf_counter() - total_start
-        self._print_stats_report(stats, total_elapsed)
-
-    @staticmethod
-    def _print_stats_report(stats, total_elapsed):
-        n = stats["count"] or 1
-        sum_parts = stats['init'] + stats['read'] + stats['render'] + stats['write'] + stats[
-            'cleanup']
-        unknown = total_elapsed - sum_parts
-
-        print("=" * 40)
-        print(f"Init:         {stats['init']:7.2f}s")
-        print(f"Read:         {stats['read']:7.2f}s")
-        print(f"Render:       {stats['render']:7.2f}s")
-        print(f"Write:        {stats['write']:7.2f}s")
-        print(f"Cleanup:      {stats['cleanup']:7.2f}s")
-        print(f"Unknown:      {unknown:7.2f}s ")
-        print("-" * 40)
-        print(f"Wall Time:    {total_elapsed:7.2f}s")
-
-        # Efficiency Ratio logic:
-        # Only Read/Render/Write can be parallelized in Phase 3.
-        # Init and Cleanup stay serial.
-        parallel_potential = stats['read'] + stats['render'] + stats['write']
-        efficiency = parallel_potential / (total_elapsed - stats['init'] - stats['cleanup'])
-        print(f"Efficiency:   {efficiency:7.2f}x")
-        print("=" * 40 + "\n")
-
-    def _create_pool_map(self, io, dst) -> Dict[DriverKey, SharedMemoryPool]:
-        block_h, block_w = dst.block_shapes[0]
-
-        # Determine universal slot size (Block + Max Halo)
-        max_halo = max([self.cfg.get_spec(k).halo_px for k in io.sources.keys()])
-        pool_h, pool_w = block_h + 2 * max_halo, block_w + 2 * max_halo
-
-        slots = 16  # Adjust based on RAM
-        pool_map = {}
-
-        for drv_key in io.sources.keys():
-            drv_spec = self.cfg.get_spec(drv_key)
-            val_dtype = np.uint8 if drv_spec.dtype == np.uint8 else np.float32
-
-            spec = PoolSpec(
-                data_shape=(pool_h, pool_w), data_dtype=np.dtype(val_dtype),
-                mask_shape=(pool_h, pool_w, 1), mask_dtype=np.dtype(np.float32)
-            )
-            # Use a unique prefix per driver to avoid name collisions in the OS
-            pool_map[drv_key] = SharedMemoryPool(spec, slots, prefix=f"tr_{drv_key.value}")
-
-        return pool_map
-
-    @staticmethod
-    def _calculate_preview_window(src, percent: float, rel_x: float, rel_y: float) -> Window:
-        """Calculates a global Window based on normalized focal points (0.0-1.0)."""
-        full_w, full_h = src.width, src.height
-        target_w, target_h = int(full_w * percent), int(full_h * percent)
-
-        # Calculate top-left corner from focal point
-        col_off = int(full_w * rel_x) - (target_w // 2)
-        row_off = int(full_h * rel_y) - (target_h // 2)
-
-        # Snap to 256 for processing efficiency
-        col_off = (max(0, col_off) // 256) * 256
-        row_off = (max(0, row_off) // 256) * 256
-
-        # Clamp to bounds
-        col_off = max(0, min(col_off, full_w - target_w))
-        row_off = max(0, min(row_off, full_h - target_h))
-
-        return Window(
-            col_off, row_off, min(target_w, full_w - col_off), min(target_h, full_h - row_off)
+        return JobManifest(
+            job_id=job_id, render_cfg=render_cfg, resources=resources,
+            final_out_path=final_out_path, temp_out_path=temp_out_path, profile=profile,
+            region_id=geography_hash, envelope=envelope, write_offset=write_offset,
+            render_params=(percent, row_focal, col_focal), driver_metadata=driver_metadata
         )
 
     @staticmethod
-    def _build_output_profile(io: RasterManager) -> dict:
+    def generate_content_hash(data: dict) -> str:
+        """Create a stable MD5 hash of a dictionary."""
+        # sort_keys=True is vital to ensure the same YAML content
+        # produces the same hash regardless of key order.
+        encoded = json.dumps(data, sort_keys=True).encode("utf-8")
+        return hashlib.md5(encoded).hexdigest()
+
+    @staticmethod
+    def build_temp_output_path(final_path: Path, job_id: str) -> Path:
+        """
+        Build a temporary output path in the same directory as the final output.
+
+        Args:
+            final_path: Final published output path.
+            job_id: Active job identifier.
+
+        Returns:
+            Temporary render output path.
+        """
+        return final_path.with_name(f"{final_path.stem}.{job_id}.tmp")
+
+    @staticmethod
+    def generate_region_hash(resources) -> str:
+        """
+        Create a stable hash based on file paths and modification timestamps.
+
+        Args:
+            resources: Resolved render resources.
+
+        Returns:
+            Stable hash representing the current source-data region context.
+        """
+        context_parts = []
+
+        for path in sorted(Path(p).resolve() for p in resources.drivers.values()):
+            stat = path.stat()
+            context_parts.append(f"{path}|{stat.st_mtime_ns}")
+
+        raw_context = "|".join(context_parts)
+        return hashlib.md5(raw_context.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def build_output_profile(io: "IOManager") -> dict:
+        """
+        Generate the Rasterio profile for the output GeoTIFF.
+
+        Args:
+            io: Open IO manager for the anchor dataset.
+
+        Returns:
+            Raster output profile dictionary.
+        """
         anchor = io.anchor_src
         return {
             "driver": "GTiff", "height": anchor.height, "width": anchor.width, "count": 3,
@@ -322,18 +644,120 @@ class PipelineEngine:
             "nodata": None,
         }
 
-    def load_ramps(self) -> None:
-        """Load ramps and update config paths."""
-        ramp_files = self.surface_eng.load_surface_ramps(self.resources)
-        # Note: In Phase 3, this will be handled before ConfigMgr is locked
-        # For now, we update the existing files dict
-        self.cfg.files.update({k: Path(v) for k, v in ramp_files.items()})
+    @staticmethod
+    def calculate_preview_window(
+            src, percent: float, rel_x: float, rel_y: float, ) -> Window:
+        """
+        Calculate a global preview window using normalized focal coordinates.
+
+        Args:
+            src: Anchor Rasterio source.
+            percent: Fraction of the full image size to render.
+            rel_x: Horizontal focal point in normalized coordinates.
+            rel_y: Vertical focal point in normalized coordinates.
+
+        Returns:
+            Block-aligned preview window.
+        """
+        full_w, full_h = src.width, src.height
+        target_w, target_h = int(full_w * percent), int(full_h * percent)
+
+        col_off = int(full_w * rel_x) - (target_w // 2)
+        row_off = int(full_h * rel_y) - (target_h // 2)
+
+        col_off = (max(0, col_off) // 256) * 256
+        row_off = (max(0, row_off) // 256) * 256
+
+        col_off = max(0, min(col_off, full_w - target_w))
+        row_off = max(0, min(row_off, full_h - target_h))
+
+        return Window(
+            col_off, row_off, min(target_w, full_w - col_off), min(target_h, full_h - row_off), )
 
 
-def on_worker_done(future):
-    try:
-        future.result()  # This will re-raise any exception that happened in the worker
-    except Exception as e:
-        print(f"🔥 WORKER CRASHED: {e}")
-        traceback.print_exc()
+class ContextFactory:
+    """
+    Assembles worker-specific contexts for serialization.
+    Handles the "handshake" between the persistent daemon state
+    and the ephemeral render task.
+    """
+
+    def __init__(
+            self, factor_eng, surface_eng, themes, compositor, noise_registry
+    ):
+        # These are the procedural engines that persist in the Daemon
+        self.factor_eng = factor_eng
+        self.surface_eng = surface_eng
+        self.themes = themes
+        self.compositor = compositor
+        self.noise_registry = noise_registry
+
+    def sync_and_build(
+            self, manifest: JobManifest, resources: 'EngineResources'
+    ) -> Tuple[ReaderContext, WorkerContext, WriterContext]:
+        """
+        1. Synchronizes the Registry (Purge slot cache if region changed).
+        2. Builds Contexts for Reader, Worker, and Writer.
+        """
+
+        # 1. Registry Context Check
+        # If the region_id has changed, we must purge the slot cache mappings
+        if resources.registry.context_id != manifest.region_id:
+            print(
+                f"🔄 [ContextFactory] Region is different. Region hash={manifest.region_id}. Purging Slot Cache"
+                )
+            resources.registry.reset_context(manifest.region_id)
+        else:
+            print(f" [ContextFactory] Warm Slot Cache: {manifest.region_id}")
+
+        # 2. Instantiate Reader Context
+        reader_ctx = ReaderContext(
+            render_cfg=manifest.render_cfg, anchor_key=manifest.resources.anchor_key,
+            source_paths=manifest.resources.drivers, job_id=manifest.job_id
+        )
+
+        # 3. Instantiate Worker Context
+        worker_ctx = WorkerContext(
+            render_cfg=manifest.render_cfg,  themes=self.themes, compositor=self.compositor,
+            pipeline=manifest.render_cfg.pipeline, anchor_key=manifest.resources.anchor_key,
+            surface_inputs=manifest.resources.surface_inputs, resources=manifest.resources,
+            noise_registry=self.noise_registry, job_id=manifest.job_id
+        )
+
+        # 4. Instantiate Writer Context
+        writer_ctx = WriterContext(
+            output_path=manifest.temp_out_path, output_profile=manifest.profile,
+            write_offset_row=manifest.write_offset[0], write_offset_col=manifest.write_offset[1],
+            job_id=manifest.job_id
+        )
+
+        return reader_ctx, worker_ctx, writer_ctx
+
+
+@dataclass
+class JobTelemetry:
+    job_id: str = "IDLE"
+    start_time: float = 0.0
+    last_report_time: float = 0.0
+    total_tiles: int = 0
+    tiles_written: int = 0
+    op_counts: Counter = field(default_factory=Counter)
+    last_op: Op = Op.TILES_FINALIZED
+    unknown_ops: int = 0
+    bad_job_ids: int = 0
+    pending_dependencies: dict[int, int] = field(default_factory=dict)
+
+    def reset(self, job_id: str, total_tiles: int) -> None:
+        """Reset telemetry for a newly started job."""
+        self.job_id = job_id
+        self.total_tiles = total_tiles
+        self.tiles_written = 0
+        self.start_time = time.perf_counter()
+        self.last_report_time = 0.0
+        self.pending_dependencies.clear()
+
+    def print_report(
+            self, *, orchestrator: "PipelineOrchestrator", interval: float = 5.0, ) -> None:
+        """Print a throttled runtime report for debugging."""
+        return
 

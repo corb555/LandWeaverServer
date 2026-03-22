@@ -71,38 +71,27 @@ class QmlPalette:
         return {self.value_for_label(lbl) for lbl in labels}
 
     def build_lut_rgb(
-            self, *, size: int = 256, fill_rgb: tuple = (0, 0, 0)
-    ) -> np.ndarray:
-        """Build dense RGB LUT for uint8 index rasters with diagnostic logging."""
+            self, *, size: int = DEFAULT_LUT_SIZE, fill_rgb: RGB = (0, 0, 0), ) -> np.ndarray:
+        """Build dense RGB LUT for uint8 index rasters.
+
+        Returns:
+            (size, 3) uint8 LUT.
+        """
         if size <= 0:
             raise ValueError(f"LUT size must be > 0, got {size}")
 
         lut = np.empty((size, 3), dtype=np.uint8)
         lut[:, :] = np.asarray(fill_rgb, dtype=np.uint8)
 
-        print("\n Building Thematic Color LUT :")
-        print(f"{'ID':>4} | {'Label':<30} | {'RGB':<12} | {'Hex'}")
-        print("-" * 65)
-
-        # Sort by value so the terminal output is easy to read
-        sorted_entries = sorted(self.entries_by_value.items(), key=lambda x: int(x[0]))
-
-        for v_str, entry in sorted_entries:
-            v = int(v_str)
-            if 0 <= v < size:
+        for v, entry in self.entries_by_value.items():
+            if 0 <= int(v) < size:
                 rgb = _parse_color_attr(entry.color_hex)
                 if rgb is not None:
-                    lut[v, :] = np.asarray(rgb, dtype=np.uint8)
+                    lut[int(v), :] = np.asarray(rgb, dtype=np.uint8)
 
-                    # Log the mapping
-                    label = getattr(entry, 'label', 'Unknown')
-                    if label and label[0].isalpha():
-                        print(f"{v:>4} | {label:<40} | {str(rgb)}")
-
-        print("-" * 65 + "\n")
         return lut
 
-    def build_lut_rgb_a(
+    def build_lut_rgba(
             self, *, size: int = DEFAULT_LUT_SIZE,
             fill_rgba: RGBA = (0, 0, 0, 255), ) -> np.ndarray:
         """Build dense RGBA LUT for uint8 index rasters (QGIS-consistent alpha).
@@ -243,7 +232,7 @@ def _parse_color_attr(raw: str) -> Optional[RGB]:
         if len(hx) != 6:
             return None
         try:
-            return int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+            return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
         except ValueError:
             return None
 
@@ -251,7 +240,7 @@ def _parse_color_attr(raw: str) -> Optional[RGB]:
     if len(parts) >= 3:
         try:
             r, g, b = (int(float(parts[0])), int(float(parts[1])), int(float(parts[2])))
-            return int(np.clip(r, 0, 255)), int(np.clip(g, 0, 255)), int(np.clip(b, 0, 255))
+            return (int(np.clip(r, 0, 255)), int(np.clip(g, 0, 255)), int(np.clip(b, 0, 255)))
         except ValueError:
             return None
 

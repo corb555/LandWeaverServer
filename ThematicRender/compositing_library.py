@@ -109,13 +109,13 @@ class CompositingLibrary:
     @staticmethod
     @register_op(
         "add_specular_highlights", required_attrs=["buffer", "factor_nm"], required_params=["color"]
-        )
+    )
     def add_specular(buffers, surfaces, factors, factor, spec, ctx):
         current = buffers.get(spec.buffer)
         _validate_spatial(current, spec.buffer, ctx.target_shape)
 
-        color = np.array(spec.params["color"], dtype="float32").reshape(1, 1, 3)
-        intensity = float(spec.params.get("intensity", 1.0))
+        color = np.array(spec.system_params["color"], dtype="float32").reshape(1, 1, 3)
+        intensity = float(spec.system_params.get("intensity", 1.0))
 
         reflection = (factor * color) * intensity
         buffers[spec.buffer] = np.clip(current + reflection, 0, 255)

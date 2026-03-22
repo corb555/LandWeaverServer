@@ -2,11 +2,11 @@ from functools import wraps
 from typing import Callable, Dict, Any
 
 import numpy as np
-
 from ThematicRender.keys import DriverKey
 
 # surface_library.py
 SURFACE_PROVIDER_REGISTRY: Dict[str, Callable] = {}
+MODIFIER_REGISTRY: Dict[str, Callable] = {}
 
 
 def spatial_surface(provider_id: str):
@@ -44,27 +44,30 @@ def _ramp_provider(ctx, spec, data_2d, masks_2d, factors_2d, style_engine):
     factor_val = factors_2d.get(f_id)
 
     interp_func = ctx.surfaces.get(spec.key)
+    if interp_func is None:
+        print(f" Key='{spec.key}' Surfaces: {ctx.surfaces}")
+        print(ctx)
     u_min, u_max = float(interp_func.x[0]), float(interp_func.x[-1])
 
     coords = np.clip(factor_val, u_min, u_max)
     return interp_func(coords)
 
+
 @spatial_surface("theme")
-def _style_provider(ctx, spec, data_2d, masks_2d, factors_2d, style_engine):
-    """
-    Fetches categorical RGB.
-    """
-    # 1. Extract the specific thematic array from the  dictionary
-    theme_ids = data_2d.get(DriverKey.THEME)
+def _theme_provider(ctx, spec, data_2d, masks_2d, factors_2d, style_engine):
+    # DYNAMIC LOOKUP: Use the driver key defined in the surface spec
+    # This handles whatever Enum member (THEME, THEME_COMPOSITE, etc.) is actually used
+    theme_ids = data_2d.get(spec.driver)
 
     if theme_ids is None:
-        raise ValueError(f"Error: Surface Library 'style': {DriverKey.THEME} not found")
+        # Useful error to catch the String vs Enum issue
+        available_keys = list(data_2d.keys())
+        raise ValueError(
+            f"Theme Provider: Driver '{spec.driver}' ({type(spec.driver)}) not found. "
+            f"Available keys: {available_keys}"
+        )
 
-    # 2. Pass the ARRAY, not the DICTIONARY, to the style engine
     return style_engine.get_theme_surface(theme_ids)
-
-
-MODIFIER_REGISTRY: Dict[str, Callable] = {}
 
 
 def register_modifier(mod_id: str):

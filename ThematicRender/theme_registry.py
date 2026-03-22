@@ -2,9 +2,8 @@ from typing import Dict, Optional, Any
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, binary_fill_holes, median_filter
-
-from ThematicRender.config_mgr import ConfigMgr
 from ThematicRender.qml_palette import QmlPalette, _parse_color_attr
+from ThematicRender.render_config import RenderConfig
 
 
 # theme_registry.py
@@ -27,7 +26,8 @@ class ThemeRegistry:
     2. Smoothing: Provides a 'Melt and Grow' algorithm to resolve aliasing
        (stairsteps) in low-resolution source data based on explicit precedence rules.
     """
-    def __init__(self, cfg: ConfigMgr):
+
+    def __init__(self, cfg: RenderConfig):
         self.cfg = cfg
 
         # 1. Metadata (Populated in Main, sent to Workers via Pickling)
@@ -43,26 +43,39 @@ class ThemeRegistry:
         """Provides the mapping even if qml_palette isn't loaded (e.g. in Main)."""
         return self._label_to_id
 
-    def load_metadata(self) -> None:
+    def load_metadata(self, render_cfg: RenderConfig) -> None:
         """
-        Parses the QML to extract logic-friendly metadata.
-        Call this in the MAIN process before analyze_pipeline.
+        Parses the QML from the CURRENT job config to extract metadata.
         """
-        qml_path = self.cfg.path("theme_qml")
+        # Use the path from the manifest's config
+        qml_path = render_cfg.path("theme_qml")
+
         if not qml_path or not qml_path.exists():
             raise FileNotFoundError(f"Theme QML not found: {qml_path}")
 
-        # Parse the XML once
+        #print(f"🎨 [ThemeRegistry] Loading colors from {qml_path.name}")
         self.qml_palette = QmlPalette.load(qml_path)
 
-        # Populate the simple, picklable dictionaries
-        self._label_to_id = self.qml_palette.value_by_label
+        # Clear old data if this is a new job
+        self._label_to_id.clear()
+        self._id_to_color.clear()
 
-        # Capture the RGB colors for the Worker's LUT
+        self._label_to_id.update(self.qml_palette.value_by_label)
+
         for v_str, entry in self.qml_palette.entries_by_value.items():
             rgb = _parse_color_attr(entry.color_hex)
             if rgb:
-                self._id_to_color[int(v_str)] = rgb
+                val = int(v_str)
+                self._id_to_color[val] = rgb
+                # DIAGNOSTIC: Ensure we found the water
+                #if val == 4:
+                #    print(f"DEBUG [ThemeRegistry] Found Water (ID 4): {rgb}")
+
+        #print(f"🎨 [ThemeRegistry] Loaded {len(self._id_to_color)} color mappings.")
+        # EVIDENCE TRACE 1:
+        #print(f"TRACE [Main]: QML Path used: {render_cfg.path('theme_qml')}")
+        #print(f"TRACE [Main]: Dict Content for Water (ID 4): {self._id_to_color.get(4)}")
+        #print(f"TRACE [Main]: Total labels in dict: {len(self._label_to_id)}")
 
     def load_theme_style(self) -> None:
         """
@@ -79,18 +92,22 @@ class ThemeRegistry:
         for val, rgb in self._id_to_color.items():
             if 0 <= val < 256:
                 lut[val] = rgb
+            else:
+                raise ValueError(f"BAD LUT. Val={val}")
 
         self.lut_rgb = lut
+        #print(f"🔍 [ID:{id(self)}] load_theme_style COMPLETE. LUT[4] value: {self.lut_rgb[4]}")
+
 
     def get_theme_surface(self, theme_ids: np.ndarray) -> np.ndarray:
         """
         Synthesizes an RGB surface from an ID array using the loaded QML palette.
         """
         if self.lut_rgb is None:
-            raise RuntimeError("ThemeRegistry: get_theme_surface called before load_theme_style.")
+            self.load_theme_style()
 
         # Guard against completely empty tiles
-        if theme_ids is None :
+        if theme_ids is None:
             raise ValueError(f"get_theme_surface: theme_ids is None")
 
         # Map IDs to RGB colors via the LUT
@@ -98,10 +115,19 @@ class ThemeRegistry:
 
         # Ensure ID 0 (Background/Void) remains solid black
         rgb_u8[theme_ids == 0] = 0
+        #print(f"get theme surface")
+
+        # DEBUG TRACE 3:
+        # Let's look at the physical memory of the LUT at index 4
+        if self.lut_rgb is not None:
+             actual_lut_color = self.lut_rgb[4]
+             #print(f"TRACE [Worker Task]: LUT value at Index 4: {actual_lut_color}")
 
         return rgb_u8.astype("float32", copy=False)
 
-    def get_smoothed_ids(self, theme_ids_2d: np.ndarray, smoothing_specs: Dict[str, Any]) -> np.ndarray:
+    def get_smoothed_ids(
+            self, theme_ids_2d: np.ndarray, smoothing_specs: Dict[str, Any]
+    ) -> np.ndarray:
         """
         Resolves aliasing and precedence using an explicit set of smoothing rules.
 
@@ -113,9 +139,7 @@ class ThemeRegistry:
             return theme_ids_2d
 
         return self.get_smooth_theme(
-            theme_ids_2d,
-            self.label_to_id,
-            smoothing_specs
+            theme_ids_2d, self.label_to_id, smoothing_specs
         )
 
     @staticmethod

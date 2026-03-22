@@ -1,7 +1,9 @@
 from time import perf_counter
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
+from rasterio.windows import Window
+from ThematicRender.ipc_packets import WindowRect
 
 ERR_PREFIX = "❌ Error: Blend Pipeline - "
 
@@ -68,6 +70,94 @@ DTYPE_ALIASES = {
     "int32": np.int32, "uint32": np.uint32, "float32": np.float32, "float": np.float32,
     "float64": np.float64, "double": np.float64,
 }
+
+import pickle
+
+from typing import Any, Optional
+
+def dot_get(obj: Any, path: str, default: Any = None) -> Any:
+    """
+    Retrieves a nested value from a dictionary or object using a dot-separated path.
+    Example: dot_get(cfg, "drivers.water.max_opacity")
+    """
+    if obj is None:
+        return default
+
+    # 1. If we were passed the RenderConfig object itself,
+    # start the search inside its raw_defs dictionary.
+    current = obj.raw_defs if hasattr(obj, 'raw_defs') else obj
+
+    # 2. Split the path (e.g., "drivers.water.max_opacity" -> ["drivers", "water", "max_opacity"])
+    keys = path.split(".")
+
+    for key in keys:
+        if isinstance(current, dict):
+            # Move one level deeper into the dictionary
+            current = current.get(key)
+        elif hasattr(current, key):
+            # Handle cases where it might be a nested dataclass/object
+            current = getattr(current, key)
+        else:
+            return default
+
+        # If at any point we hit a dead end, return the default
+        if current is None:
+            return default
+
+    return current
+
+def assert_pickle(obj: Any, name: str) -> None:
+    """
+    Attempt to pickle an object into a memory buffer to ensure it
+    crosses process boundaries safely.
+    """
+    # Check size:
+    find_the_fat(obj, name)
+
+    try:
+        # Use a high protocol for performance, matching what SHM uses
+        pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        print(f"❌ Pickle Error for {name}")
+        debug_pickle(obj)
+
+
+def debug_pickle(obj, path=""):
+    """Recursively checks which attribute is failing to pickle."""
+    for attr in dir(obj):
+        if attr.startswith('__'): continue
+        val = getattr(obj, attr)
+        try:
+            pickle.dumps(val)
+        except Exception:
+            print(f"❌ Failed at: {path}.{attr} (Type: {type(val)})")
+            # Recurse into the failing object
+            debug_pickle(val, f"{path}.{attr}")
+
+
+def find_the_fat(obj, name="root"):
+    """Recursively finds which attribute is larger than 1MB."""
+    p_size = len(pickle.dumps(obj))
+    if p_size > 1_000_000:
+        print(f"📦 {name} is {p_size:,} bytes (Type: {type(obj)})")
+
+        # If it's a dataclass with slots
+        if hasattr(obj, "__slots__"):
+            for s in obj.__slots__:
+                find_the_fat(getattr(obj, s), f"{name}.{s}")
+        # If it's a standard object
+        elif hasattr(obj, "__dict__"):
+            for k, v in obj.__dict__.items():
+                find_the_fat(v, f"{name}.{k}")
+        # If it's a dict
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                find_the_fat(v, f"{name}.{k}")
+
+
+def window_from_rect(r: WindowRect) -> Window:
+    col, row, w, h = r
+    return Window(col, row, w, h)
 
 
 class TimerStats:
@@ -142,10 +232,9 @@ def print_once(msg_id: str, *args, **kwargs):
 
 def stats_once(tag, a):
     print_once(
-        tag,
-        f"{tag} shape={a.shape} min={float(a.min()):.4f} max={float(a.max()):.4f} mean="
-        f"{float(a.mean()):.4f}"
-        )
+        tag, f"{tag} shape={a.shape} min={float(a.min()):.4f} max={float(a.max()):.4f} mean="
+             f"{float(a.mean()):.4f}"
+    )
 
 
 def reset_print_once():

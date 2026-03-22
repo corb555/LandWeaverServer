@@ -151,7 +151,7 @@ class NoiseEditor(QMainWindow):
         pixmap = QPixmap.fromImage(qimg)
         self.preview_label.setPixmap(
             pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
+        )
 
 
 if __name__ == "__main__":

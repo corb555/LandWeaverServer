@@ -12,15 +12,17 @@ RENDER_SCHEMA: dict[str, Any] = {
     "override_factor": {"type": "string", "required": False},
     "debug_factors": {"type": "string", "required": False},
 
-    "files": {
-        "type": "dict", "required": True
-    },
-    "prefixed_files": {
-        "type": "dict", "required": False
-    },
-    "theme_smoothing_specs": {
-        "type": "dict", "required": False
-    },
+    "files": {"type": "dict", "required": True},
+    "prefixed_files": {"type": "dict", "required": False},
+    "theme_smoothing_specs": {"type": "dict", "required": False},
+    "driver_specs": {"type": "dict", "required": False},
+    "factor_specs": {"type": "dict", "required": False},
+    "factors": {"type": "dict", "required": False},
+    "noise_profiles": {"type": "dict", "required": False},
+    "pipeline": {"type": "list", "required": True},
+    "surface_modifier_specs": {"type": "dict", "required": False},
+    "surfaces": {"type": "dict", "required": False},
+
     # ------------------------------------------------------------------
     # Driver parameter blocks (NO per-driver enabled flags)
     # ------------------------------------------------------------------

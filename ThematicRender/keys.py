@@ -1,10 +1,9 @@
 # keys.py
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Optional, Tuple, Set, FrozenSet, List, Dict, Protocol
-
-import numpy as np
 
 
 class SurfaceKey(StrEnum):
@@ -29,7 +28,7 @@ class DriverKey(StrEnum):
     These are the file keys that point to raster datasets used to compute factors
     (e.g., slope, precipitation, hillshade).
     """
-    WATER_PROXIMITY = "water_prox"
+    WATER_PROXIMITY = "water_proximity"
     DEM = "dem"
     PRECIP = "precip"
     LITH = "lith"
@@ -61,11 +60,17 @@ class FileKey(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class DriverSpec:
-    dtype: np.dtype
+class DriverRndrSpec:
     halo_px: int
-    cleanup_type: Optional[str] = None  # 'categorical' or 'continuous'
+    cleanup_type: Optional[str] = None
     smoothing_radius: Optional[float] = None
+    dtype: Any = "float32"
+
+
+@dataclass(frozen=True, slots=True)
+class DriverHWSpec:
+    halo_px: int
+    dtype: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +105,7 @@ class FactorSpec:
     required_noise: Optional[str] = None
     desc: str = ""
     params: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass(frozen=True, slots=True)
 class _BlendSpec:
@@ -157,11 +163,11 @@ class SurfaceModifierSpec:
     desc: str = ""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=False, slots=True)
 class RequiredResources:
     """The master manifest produced by scanning the pipeline."""
     # Physical Drivers
-    drivers: Set[DriverKey]
+    drivers: Dict[DriverKey, Path]
     files: Set[FileKey]
     factor_inputs: Set[str]
 
@@ -172,11 +178,31 @@ class RequiredResources:
     noise_profiles: Dict[str, NoiseSpec]
 
     # Surface Management
-    # The set of SurfaceKeys actually required by the BLEND_PIPELINE
     surface_inputs: Set[SurfaceKey]
-
-    # The surface key used as the base for HSV-shifted derivations
     primary_surface: Optional[SurfaceKey]
+
+    # --- THE HASHES ---
+    # Initialized as empty strings, populated by TaskResolver
+    geography_hash: str = ""
+    logic_hash: str = ""
+    style_hash: str = ""
+
+    def with_hashes(
+        self,
+        geography_hash: str,
+        logic_hash: str,
+        style_hash: str
+    ) -> 'RequiredResources':
+        """
+        Returns a copy of the resources with updated content hashes.
+        Uses dataclasses.replace to handle the object update cleanly.
+        """
+        return replace(
+            self,
+            geography_hash=geography_hash,
+            logic_hash=logic_hash,
+            style_hash=style_hash
+        )
 
 
 @dataclass(frozen=True, slots=True)

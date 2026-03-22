@@ -3,14 +3,13 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Iterable, Final
 
 import numpy as np
+from rasterio.windows import Window
 from scipy.interpolate import interp1d
-
 from ThematicRender.color_config import ColorConfig
 from ThematicRender.color_ramp_hsv import get_ramp_from_yml
-from ThematicRender.config_mgr import ConfigMgr
-from ThematicRender.ipc_packets import Window
 from ThematicRender.keys import RequiredResources, SurfaceKey, FileKey, DriverKey
 from ThematicRender.noise_library import NoiseLibrary
+from ThematicRender.render_config import RenderConfig
 from ThematicRender.surface_library import SURFACE_PROVIDER_REGISTRY, MODIFIER_REGISTRY
 
 # surface_engine.py
@@ -37,7 +36,7 @@ def strip_alpha_or_fail(colors: np.ndarray, *, context: str) -> np.ndarray:
 
 
 class SurfaceEngine:
-    def __init__(self, cfg: ConfigMgr):
+    def __init__(self, cfg: RenderConfig):
         self.cfg = cfg
         self.target_shape = None
 
@@ -46,8 +45,7 @@ class SurfaceEngine:
         self.ramp_files: Dict[str, Path] = {}
 
         # Load registry from settings
-        from ThematicRender.settings import SURFACE_SPECS
-        self.spec_registry = {s.key: s for s in SURFACE_SPECS}
+        self.spec_registry = {s.key: s for s in cfg.surfaces}
 
         # --- DETERMINISTIC OFFSET CACHE ---
         # We calculate this once. Every worker process will inherit
@@ -85,11 +83,26 @@ class SurfaceEngine:
                     f"Surface Engine: Required surface '{srf_key.value}' not found in registry. "
                     f"Check your SURFACE_SPECS definition. Available: {available}"
                 )
+            #print(f"Gen surf: '{srf_key}' Provider '{spec.provider_id}'")
+            # TODO DEBUG **********
+            if srf_key == SurfaceKey.THEME_OVERLAY:
+                #print(f"DEBUG [SurfaceEngine] Processing THEME_OVERLAY")
+                #print(f"DEBUG [SurfaceEngine]   Spec Driver: {spec.driver}")
+
+                # Is the data actually in the dict we are about to pass to the provider?
+                if spec.driver in data_2d:
+                     val = np.unique(data_2d[spec.driver])
+                     #print(f"DEBUG [SurfaceEngine]   Data in data_2d for this driver: {val}")
+                else:
+                     print(f"❌ ERROR [SurfaceEngine]: Driver {spec.driver} MISSING from data_2d")
 
             provider_fn = SURFACE_PROVIDER_REGISTRY.get(spec.provider_id)
             if not provider_fn:
                 available = list(SURFACE_PROVIDER_REGISTRY.keys())
-                raise ValueError(f"Unknown provider '{spec.provider_id}' for surface {srf_key}. Available: {available}")
+                raise ValueError(
+                    f"Unknown provider '{spec.provider_id}' for surface {srf_key}. Available: "
+                    f"{available}"
+                )
 
             try:
                 # --- STAGE 1: SYNTHESIS ---
@@ -114,20 +127,20 @@ class SurfaceEngine:
         return rendered_surfaces
 
     def _apply_modifiers(
-            self, srf_key: SurfaceKey, spec: Any, img_block: np.ndarray,
-            noises: NoiseLibrary, window: Window
+            self, srf_key: SurfaceKey, spec: Any, img_block: np.ndarray, noises: NoiseLibrary,
+            window: Window
     ) -> np.ndarray:
         """
         Applies a sequence of transformations to a single RGB block.
         """
-        from ThematicRender.settings import SURFACE_MODIFIER_SPECS
+        # from ThematicRender.settings import SURFACE_MODIFIER_SPECS
 
         for mod_cfg in spec.modifiers:
             mod_id = mod_cfg.get("id")
             profile_id = mod_cfg.get("profile_id")
 
             mod_fn = MODIFIER_REGISTRY.get(mod_id)
-            profile = SURFACE_MODIFIER_SPECS.get(profile_id)
+            profile = self.cfg.modifiers.get(profile_id)
 
             if not mod_fn or not profile:
                 continue
@@ -153,7 +166,7 @@ class SurfaceEngine:
         self.ramp_files.clear()
         self.surfaces.clear()
 
-        print("🔓 Initializing Surface Ramps...")
+        #print("🔓 Initializing Surface Ramps...")
 
         ramps_yml_path = self.cfg.path(FileKey.RAMPS_YML.value)
 
@@ -173,7 +186,7 @@ class SurfaceEngine:
                 available = list(self.spec_registry.keys())
                 raise ValueError(
                     f"Missing SurfaceSpec for required input '{skey}'. Available: {available}"
-                    )
+                )
 
             # Only 'ramp' providers need a scipy interpolator
             if spec.provider_id != "ramp":
@@ -200,9 +213,9 @@ class SurfaceEngine:
         if ramp_path is None or not ramp_path.exists():
             raise FileNotFoundError(
                 f"Ramp file for {skey.value} could not be resolved at {ramp_path}"
-                )
+            )
 
-        print(f"   🔹 {skey.value.ljust(15)} <- {ramp_path.name}")
+        #print(f"   🔹 {skey.value.ljust(15)} <- {ramp_path.name}")
 
         # 1. Parse and build the scipy function
         z, c = ColorConfig.parse_ramp(str(ramp_path))
@@ -213,7 +226,7 @@ class SurfaceEngine:
 
     def _resolve_ramp_file(
             self, *, surface_key, yaml_name, base_ramp_path, ramp_yml_path, output_dir
-            ):
+    ):
         """Resolves path using ConfigMgr or derives a new one using ramps_yml."""
         # Check ConfigMgr for an explicit file path provided by user
         explicit_path = self.cfg.path(surface_key.value)
@@ -225,7 +238,7 @@ class SurfaceEngine:
         if ramp_yml_path is None:
             raise ValueError(
                 f"Cannot derive ramp for '{surface_key}': ramps_yml path not provided."
-                )
+            )
 
         out_path = output_dir / f"gen_{yaml_name}.txt"
         try:

@@ -1,34 +1,63 @@
 
 ## Project Summary
 
-This project is a high-performance spatial compositing engine for generating natural-looking raster imagery from GIS data. It combines procedural noise, multi-scale Gaussian filtering, and configuration-driven pipelines to synthesize visually rich terrain and land-cover surfaces. A configurable blend pipeline defines how driver rasters are loaded, transformed, and composited into the final image.
+This project is a high-performance spatial compositing engine for generating natural-looking raster imagery from GIS data. 
+It combines procedural noise, multi-scale Gaussian filtering, and explicit configuration-driven pipelines to synthesize 
+visually rich terrain and land-cover surfaces. A configurable blend pipeline defines how driver rasters are loaded, 
+transformed, and composited into the final image.
 
 ## Design
 
 **Explicit configuration**
-All processing steps, parameters, and layer definitions are driven by a centralized configuration structure. Configuration is fully explicit, and configuration errors are treated as fatal rather than silently falling back to defaults.
+All processing steps, parameters, and layer definitions are driven by a centralized configuration structure. Configuration 
+is fully explicit, and configuration errors are treated as fatal rather than silently falling back to defaults.
 
 **Engine/library pattern**
-The system follows an engine/library architecture, with separate components for factors (alpha layers), noise, surfaces, themes, and compositing.
+The system follows an engine/library architecture, with separate components for factors (alpha layers), noise, surfaces, 
+themes, and compositing.
 
 **Storage model**
 Raster blocks are stored in shared memory as 4D arrays in the form:
 
 `(slot, band, height, width)`
 
+**Caching**
+The block cache uses a fill-once policy. During the first sequential pass for a file set, blocks are admitted until cache capacity is 
+reached. After that, cache membership is frozen and remains valid across reruns. The cache is only invalidated when the 
+ file set changes.
+LRU is not effective for this workload because sequential reruns do not exhibit useful temporal locality. At the end of a 
+pass, LRU retains the most recently visited blocks from the tail of the raster, but the next pass restarts at the 
+head, so those cached blocks are evicted before they are reached again.
+
+**Cache ID**
+
+The pipeline operates on distinct regional file sets, such as Sedona, Yosemite, or Yellowstone. For each region, it 
+typically reads a group of driver files with identical extent, resolution, and tile layout. Cache contents are valid 
+only within the context of a single region and must be invalidated when the active region changes. For repeated runs 
+within the same region, the cache remains valid. The cache id will be a hash of sorted driver paths.
+
+**Block ID**
+
+Files within a region are tiled, and the pipeline may operate on either the complete tile set or a sampled subset. The 
+cache key for a block must therefore be based on the tile’s stable identity within the region, not on its position 
+within the current run. This ensures that the same tile maps to the same cache entry in both full and partial runs. 
+The tile loop generates a spatial_key for the Registry based on the window's pixel offsets (e.g., (key, x, y))
+
 **Compute model**
-A `render_task` acts as a strict boundary between storage and computation. It rehydrates shared-memory data and converts it into 2D `(height, width)` arrays before passing them to the rendering engines.
+A `render_task` acts as a strict boundary between storage and computation. It rehydrates shared-memory data and converts 
+it into 2D `(height, width)` arrays before passing them to the rendering engines.
 
 **IPC model**
-`WorkPacket` and `ResultPacket` carry only metadata and integer `slot_id` references. No raw NumPy arrays are pickled or passed between processes.
+`WorkPacket` and `ResultPacket` carry only metadata and integer `slot_id` references. No raw NumPy arrays are pickled 
+or passed between processes.
 
 **Process model**
 The system uses a three-stage multiprocessing pipeline:
 
-* **Main process:** coordinator and ticket dispenser
+* **Main process:** coordinator
 * **Reader process:** loads raster blocks into shared memory
-* **Render pool:** N worker processes perform CPU-intensive compositing
-* **Writer process:** a dedicated single process that lazy-opens the output in `r+` mode
+* **Render processes:** N worker processes perform CPU-intensive compositing
+* **Writer process:** a  single process that lazy-opens the output in `r+` mode
 
 ## Engine Design
 
@@ -49,13 +78,6 @@ The Theme Registry handles categorical rasters using a precedence-based “melt 
 The Config Manager acts as the single source of truth. In the main process, it primes metadata for a Markdown-based Pipeline Audit report and then serializes the worker context for the render pool.
 
 ## Performance
-
-**I/O strategy**
-The engine uses tiled, ZSTD-compressed GeoTIFFs to avoid the performance penalty of striped raster layouts.
-
-**Current speed**
-A 99-tile render has been reduced from about 26 seconds in serial execution to roughly 8 seconds using the optimized multiprocessing pipeline.
-
 **Current bottlenecks**
 
 1. **Startup tax** from Python process spawning and library imports
@@ -78,78 +100,46 @@ At runtime, the compositing library applies a sequence of operations to RGB surf
 
 ## Sample Natural Raster Pipeline
 
-The raster is built from four primary palettes:
+The system is highly configurable but as an example, a sample
+raster could be built from four primary palettes:
 
 * `arid_base`
 * `arid_vegetation`
 * `humid_base`
 * `humid_vegetation`
 
-Arid and humid surfaces are blended using a precipitation factor. Base and vegetation surfaces are blended using a forest-canopy factor. Additional thematic layers are derived from the USGS Landfire categorical raster, including water, glacier, outwash, volcanic, rock, and playa.
+Arid and humid surfaces are blended using a precipitation factor. 
+Base and vegetation surfaces are blended using a forest-canopy factor. 
+Additional thematic layers are derived from the USGS Landfire categorical raster, including water, glacier, 
+outwash, volcanic, rock, and playa.  
+All layers can have various noise patterns and edge smoothing applied
 
-## Roadmap
-
-**Config migration**
-Move all remaining `settings.py` configuration into `biome.yml`.
-
-**Parallel readers**
-Replace the single reader with a reader pool to better saturate SSD bandwidth. This will require some refactoring of the current reader design.
-
-**Persistent server mode**
-Add a daemon mode so parameter changes can be tested without respawning the full process graph, enabling sub-2-second iteration times.
-
-**GUI**
-Create a GUI for editing YAML parameters and triggering builds through the daemon.
-
-
-
-
-
-### 1. The Strategy: Artistic/Technical Alternation
+###  Tech Sprints
 Refine map rendering with each sprint
-*   **Validation:** By tuning the map between  sprints, we catch "Logic Regressions" (e.g., if a refactor accidentally flattens the Gamma curve).
+*   **Validation:** By tuning the map between sprints, we catch "Logic Regressions" (e.g., if a refactor accidentally 
+flattens the Gamma curve).
 *   **Feature Discovery:** Identify new feature requirements with each sprint.
----
 
-### 2. Tech Phases
-
-#### Phase 1: Code Cleanup
-* **Cleanup:** and add comments to engines, and libraries.  No functional change.
-
-#### Phase 2: Structural Hardening (The Foundation)
-*   **Goal:** Clean up and move from `if` statements to **Registries**.
-*   **Impact:** This turns the engine into a **State Machine**. Instead of the code saying `if "water" do X`, the code says `engine.execute(category_logic)`. 
-*   **Why it's needed:** This is the absolute prerequisite for the GUI. A GUI cannot easily "edit" an `if` statement, but it can easily edit a registry key.
-
-#### Phase 3: The "Source of Truth" Migration
-*   **Goal:** Death of `settings.py`.
-*   **Impact:** This decouples the **Art** (YAML) from the **Engine** (Python). 
-*   **Visual Win:** We can share a `biome.yml` with someone else, and they can produce the exact same "Sedona Look" without needing the specific Python environment tweaks.
-
-#### Phase 4: Parallel Readers (Goal 2: Full Build)
+#### Sprint 1: Parallel Readers (CURRENT SPRINT)
 *   **Goal:** Break the 12-second wall.
-*   **Impact:** This utilizes the Mac Studio’s SSD bandwidth and CPU cores to handle the "Decompression Tax." 
-*   **Performance:** This is the step that will get a full-region build (thousands of tiles) under that 10-minute target.
+*   **Impact:** This utilizes the Mac Studio’s SSD bandwidth and CPU cores to handle the "Decompression Tax."
+*   **Performance:**  Currently all pieces are multiprocessor except Readers.  This is the last step to 
+a fully multiprocessor system
+*   Hazards: 1) Ensure queues/shmem are returned to free state at the right time. 2) Ensure completion and shutdown are correct
+3) Ensure block dimensions are correct at every step. 4) Ensure we are not creating blockers for LRU and for Daemon phases.
 
-#### Phase 5: The Hot Server (Goal 3: The < 2s Loop)
+#### Sprint 2: Settings Migration
+*   **Goal:** Replace `settings.py` with biome.yml
+*   **Impact:** This decouples the settings from the code. 
+
+#### Sprint 3: The Hot Server (Goal 3: The < 2s Loop)
 *   **Goal:** Kill the "Launch Tax."
 *   **Impact:** This is the most significant change in "Feel." The engine becomes a **Daemon**. 
 *   **Workflow:** We save a file $\rightarrow$ the map updates instantly. No more waiting 8 seconds for Python to start.
 
-#### Phase 6: The GUI (The "Instrument")
-*   **Goal:** Real-time Art Direction.
-*   **Impact:** This transforms the engine into a **Creative Instrument**. Moving a slider and seeing a canyon wall change color in 1.5 seconds is where the true artistic breakthrough happens.
+#### Sprint 4: The GUI (The "Instrument")
+*   **Goal:** GUI for settings with near real-time feedback.
+*   **Impact:** This transforms the engine into a **Creative Instrument**. Moving a slider and seeing a canyon wall 
+change color immediately is where the true artistic breakthrough happens.
+* This will likely be split into multiple sprints
 
----
-
-### 3. Key Technical Considerations for Phase 4/5
-
-As we move into the "Persistent Server" and "Parallel Readers," keep these two things in mind:
-
-1.  **Stale Memory Management:** In a hot server mode, the Shared Memory segments stay alive. We’ll need a "Reset" signal to ensure that if a render fails, the next render starts with "Clean" slots.
-2.  **Registry Pattern:** For Step 2, ensure the `Library` files use a `@register` decorator pattern. This makes adding a new type of noise or a new blend op as simple as adding a function—no more modifying the `Engine` classes.
-
-### Summary
-the roadmap is perfectly sequenced. We are building the **Foundation** (Cleanup/Config) before the **Turbocharger** (MP Readers/Hot Server) and finally the **Cockpit** (GUI).
-
-**Which part of Step 1 (Cleanup/Comments) are we tackling first?** The `render_task` is the most "important" to document, but the `factor_library` is where the most "creative" math lives. 🧱🚀✅

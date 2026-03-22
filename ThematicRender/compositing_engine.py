@@ -1,10 +1,8 @@
 from typing import Dict, List, Any, Optional
 
 import numpy as np
-
 from ThematicRender.compositing_library import COMPOSITING_REGISTRY
 from ThematicRender.keys import SurfaceKey, _BlendSpec
-from ThematicRender.utils import TimerStats
 
 
 # compositing_engine.py
@@ -15,18 +13,15 @@ class CompositingEngine:
     (Ops) that combine RGB color surfaces with alpha factors.
     """
 
-    def __init__(self, timer: TimerStats):
+    def __init__(self):
         """
         Args:
-            timer: High-precision instrumentation provider for telemetry.
         """
-        self.tmr = timer
+        # self.tmr = timer
         self.target_shape = None  # (H, W) locked during first step
 
     def blend_window(
-            self,
-            surfaces: Dict[SurfaceKey, np.ndarray],
-            factors: Dict[str, np.ndarray],
+            self, surfaces: Dict[SurfaceKey, np.ndarray], factors: Dict[str, np.ndarray],
             pipeline: List[_BlendSpec]
     ) -> np.ndarray:
         """Executes the compositing pipeline for a single tile.
@@ -41,6 +36,13 @@ class CompositingEngine:
         """
         if not surfaces:
             raise ValueError("Compositing Engine: No surfaces provided to blend.")
+
+        #print(f"DEBUG [Compositor] Surfaces available: {list(surfaces.keys())}")
+        #for key, srf in surfaces.items():
+        #    if np.max(srf) > 0:
+        #        print(f"DEBUG [Compositor] Surface {key} has signal (Max: {np.max(srf)})")
+        #    else:
+        #        print(f"DEBUG [Compositor] Surface {key} is EMPTY (All Zeros)")
 
         # 1. ESTABLISH SPATIAL GEOMETRY
         # All surfaces in this tile must share the same resolution.
@@ -61,7 +63,7 @@ class CompositingEngine:
                 raise ValueError(f"Step {i}: Unknown comp_op '{step.comp_op}'")
 
             # Instrumentation: Track timing per operation
-            self.tmr.start(f"    {step.factor_nm or 'none'}:{step.comp_op}")
+            # self.tmr.start(f"    {step.factor_nm or 'none'}:{step.comp_op}")
 
             # 3. PREPARE THE SIGNAL - Fetch and apply signal shaping (Scale/Bias/Contrast)
             factor = self._condition_factor(step, factors, i)
@@ -69,25 +71,20 @@ class CompositingEngine:
             # 4. DISPATCH TO COMPOSITING LIBRARY
             try:
                 operator.func(
-                    buffers=buffers,
-                    surfaces=active_surfaces,
-                    factors=factors,
-                    factor=factor,
-                    spec=step,
-                    ctx=self
+                    buffers=buffers, surfaces=active_surfaces, factors=factors, factor=factor,
+                    spec=step, ctx=self
                 )
-            except Exception as e:
+            except MemoryError as e:
                 # Capture high-fidelity failure metadata
                 self._log_pipeline_error(e, i, step, buffers)
                 raise e
-            finally:
-                self.tmr.end()
 
         # 5. FINALIZE FOR STORAGE
         # Extract the buffer designated by the 'write_output' op
         final_img = buffers.get("__final_output__")
 
         if final_img is None:
+            print("blend image error")
             raise ValueError(
                 "Pipeline produced no output. Ensure 'write_output' is enabled in biome.yml."
             )
@@ -127,7 +124,6 @@ class CompositingEngine:
             factor = np.clip((factor - 0.5) * gain + 0.5, 0.0, 1.0)
 
         return factor
-
 
     @staticmethod
     def _log_pipeline_error(e: Exception, index: int, spec: Any, buffers: dict) -> None:
