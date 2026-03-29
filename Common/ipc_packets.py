@@ -107,6 +107,9 @@ class BlockLoadedPacket:
 class JobDonePacket:
     job_id: str
 
+@dataclass(frozen=True, slots=True)
+class ShutdownPacket:
+    msg: str
 
 @dataclass(frozen=True, slots=True)
 class ErrorPacket:

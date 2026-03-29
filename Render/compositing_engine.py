@@ -104,7 +104,7 @@ class CompositingEngine:
         if factor is None:
             available = list(factors.keys())
             raise KeyError(
-                f"Step {step_idx}: Factor '{spec.factor_nm}' missing. Available: {available}"
+                f"Step {step_idx}: factor_spec '{spec.factor_nm}' missing. Available: {available}"
             )
 
         # Enforce Firewall Standard (H, W, 1)

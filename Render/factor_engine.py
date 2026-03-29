@@ -112,7 +112,7 @@ class FactorEngine:
                 # Store the standardized factor for use in the compositor or by downstream factors
                 factors[spec.name] = res.astype("float32")
 
-            except Exception as e:
+            except MemoryError as e:
                 raise ValueError(f"\n Factor Engine: [{spec.name}] {e}")
 
         return factors

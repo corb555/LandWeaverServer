@@ -212,8 +212,6 @@ The QML maps each class ID to:
 - a text label
 - an intended RGB color
 
-At load time, the registry parses the QML and builds lookup tables (LUTs), allowing the renderer to efficiently convert
-theme IDs into RGB thematic output.
 
 If multiple theme drivers are used in the same render configuration, their category labels must be globally unique so
 that per-category configuration remains unambiguous.
@@ -248,7 +246,7 @@ outwash: { smoothing_radius: 6.0 }
 _default_: { smoothing_radius: 3.0 }
 
 theme_render:
-categories:
+ 
 water:
 enabled: true
 blur_px: 3.0
@@ -270,18 +268,60 @@ max_opacity: 0.8
       contrast: 2.0
       max_opacity: 0.8
 
-    glacier:
-      enabled: true
-      noise_amp: 0.6
-      contrast: 1.0
-      max_opacity: 0.9
+## Render Settings Hierarchy
 
-    playa:
-      enabled: true
-      blur_px: 8.0
-      noise_amp: 0.95
-      contrast: 0.5
-      max_opacity: 0.4
 
-    outwash:
-      enabled: false
+| YAML Section          | Primary Connection          | Dependency Type   | Purpose                                           |
+|:----------------------|:----------------------------|:------------------|:--------------------------------------------------|
+| **files**             | **driver_specs**            | Physical Path     | Maps unique keys to static files (e.g., QML).     |
+| **prefixed_files**    | **driver_specs**            | Physical Path     | Maps keys to regional TIFFs (e.g., _DEM.tif).     |
+| **driver_specs**      | **factors**                 | Spatial Identity  | Defines memory/dtype for math inputs.             |
+| **logic**             | **factors**                 | Math Constants    | Stores `start/full` values and `noise_amp`.       |
+| **factors**           | **surfaces**                | Functional Input  | Transforms raw data into 0..1 alpha signals.      |
+| **noise_profiles**    | **factors** & **modifiers** | Frequency Data    | Defines the organic "look" of biomes and grit.    |
+| **theme_render**      | **factors**                 | Category Tuning   | Specifically drives the `theme_composite` factor. |
+| **theme_smoothing**   | **theme_render**            | Geometry Fix      | Defines how blocky GIS pixels are rounded.        |
+| **surface_modifiers** | **surfaces**                | Pixel Shift       | Defines RGB hue-shifting (mottling) profiles.     |
+| **surfaces**          | **pipeline**                | RGB Source        | Combines Ramps + Mottling into image layers.      |
+| **pipeline**          | **OUTPUT**                  | Composition       | The final list of steps to blend RGB with Alpha.  |
+
+```mermaid
+graph TD
+    %% Physical Layer
+    subgraph Physical_Layer [Resources]
+        FILES[files] -->| | DS[driver_specs]
+        PREFIX[prefixed_files] -->| | DS
+    end
+
+    %% Logic Layer
+    subgraph Logic_Layer [Calc]
+        DS -->| | FACTORS[factors]
+        NOISE[noise_profiles] -->| | FACTORS
+        LOGIC[params] -->| | FACTORS
+        NOISE -->| | MODS[surface_modifier_specs]
+    end
+
+    %% Theme Layer
+    subgraph Theme_Layer [Themes]
+        THEME[theme_render] -->| | FACTORS
+        SMOOTH[theme_smoothing_specs] -->| | THEME
+    end
+    
+    %% Material Layer
+    subgraph Material_Layer [Surface]
+        MODS -->| | SURFACES[surfaces]
+        FACTORS -->| | SURFACES
+    end
+
+    %% Execution
+    subgraph Execution_Layer [Comp Op]
+        SURFACES -->|surface | PIPE[pipeline step]
+        FACTORS -->|factor| PIPE
+        BUFFER[Buffer]
+    end
+    
+    %% Output
+    subgraph Output [Raster]
+        PIPE -->| | RASTER[Raster]
+    end
+    ```

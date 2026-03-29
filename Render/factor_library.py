@@ -295,16 +295,55 @@ class FactorLibrary:
         return alpha * binary_mask
 
     @staticmethod
-    @spatial_factor("snow")
-    def snow(data_2d, masks_2d, name, lib_ctx):
-        # NOTE - this is going to get completely rewritten
-        params = lib_ctx.cfg.get_logic("snow")
+    @spatial_factor("snow_mask")
+    def snow_mask(data_2d, masks_2d, name, lib_ctx):
+        """
+        Calculates a naturalized snow mask using Apparent Elevation
+        and Slope-based adhesion.
+        """
+        # 1. Extract Config & Drivers
+        params = lib_ctx.cfg.get_logic(name)
+        # Using the explicit driver mapping from our new architecture
+        elev_key = lib_ctx.spec.drivers[0]  # 'dem'
+        slope_key = lib_ctx.spec.drivers[1] # 'slope'
 
-        start = float(params["snowline"]) - float(params["ramp"])
-        end = float(params["snowline"]) + float(params["ramp"])
-        density = np.clip((raw_dem - start) / (end - start + 1e-6), 0.0, 1.0)
-        noise = data_2d.get("noise", 0.5)
-        return np.clip(((density - noise) * 1.0) + 0.5, 0.0, 1.0)
+        elev = data_2d[elev_key]
+        slope = data_2d[slope_key]
+
+        # 2. Get Organic Jitter
+        # We pull the noise field to make the snowline 'wander' naturally
+        noise_id = params.get("noise_id", "empty")
+        noise = lib_ctx.noises.get(noise_id)
+        if noise is None:
+            raise ValueError(f"Noise '{noise_id}' not found")
+        noise = np.squeeze(noise.window_noise(lib_ctx.window))
+
+        # 3. Calculate Effective Elevation
+        # Instead of a flat line, we perturb the elevation with noise.
+        # This creates those natural 'tongues' of snow reaching down into valleys.
+        jitter_m = float(params.get("jitter_m", 100))
+        apparent_elev = elev + ((noise - 0.5) * 2.0 * jitter_m)
+
+        # 4. Elevation Mask (Smooth transition)
+        # We calculate visibility based on distance from the snowline
+        snowline = float(params.get("snowline_m", 3000))
+        ramp = float(params.get("transition_m", 100))
+
+        # Soft-threshold: 0.0 below line, 1.0 above line, smooth fade in-between
+        snow_signal = np.clip((apparent_elev - (snowline - ramp/2)) / ramp, 0.0, 1.0)
+
+        # 5. Slope Penalty (Physics)
+        # Snow doesn't stick to vertical cliffs.
+        s_thresh = float(params.get("slope_threshold", 35))
+        s_fade = float(params.get("slope_fade", 10))
+
+        # 1.0 on flat ground, 0.0 on steep cliffs.
+        # We fade the snow out as the slope increases.
+        slope_penalty = 1.0 - np.clip((slope - (s_thresh - s_fade)) / s_fade, 0.0, 1.0)
+
+        # 6. Final Composite
+        # Result = (Organic Elevation Mask) * (Physical Slope Mask)
+        return snow_signal * slope_penalty
 
 
 # -----------------------------------------------------------------------------

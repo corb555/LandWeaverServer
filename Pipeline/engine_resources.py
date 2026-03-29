@@ -1,6 +1,7 @@
 # engine_resources.py
 from contextlib import ExitStack
 import multiprocessing as mp
+import signal
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -12,11 +13,11 @@ from Pipeline.shared_memory import PoolSpec, SharedMemoryPool, SlotRegistry
 from Pipeline.system_config import SystemConfig
 from Render.noise_library import NoiseLibrary
 
-
 # engine_resources.py
 
 class EngineResources:
     def __init__(self, engine_cfg: 'SystemConfig'):
+        self._cleaned = False
         self.engine_cfg = engine_cfg
         self.stack = ExitStack()
         self.system_params = self.engine_cfg.get("system", {})
@@ -199,18 +200,18 @@ class EngineResources:
         self.ctx_store.write_contexts(job_id, reader_data, worker_data, writer_data)
 
     def cancel_active_job(self):
-        """Interrupts workers by setting the SHM state to -2."""
+        """Interrupts workers by setting the SHM state to CANCEL."""
         if self.ctx_store:
-            print(f"🛑 [Engine] Authoritative State: CANCEL (-2)")
+            print(f"🛑 [Engine] Global State: CANCEL ")
             self.ctx_store.set_job_cancel()
 
     def set_engine_idle(self):
-        """Sets the SHM state to -1 (Idle). Workers will release resources."""
+        """Sets the SHM state to (Idle). Workers will release resources."""
         if self.ctx_store:
             self.ctx_store.set_idle()
 
     def set_engine_shutdown(self):
-        """Sets the SHM state to -1 (Idle). Workers will release resources."""
+        """Sets the SHM state to  (Idle). Workers will release resources."""
         if self.ctx_store:
             self.ctx_store.set_shutdown()
 
@@ -222,36 +223,43 @@ class EngineResources:
             print(f"🔄 [System] Region change ({region_id[:8]}). Purging Slot Cache.")
             self.registry.reset_context(region_id)
 
-    def shutdown(self):
-        print("[EngineResources] Initiating Graceful Shutdown...")
+    def cleanup(self):
+        """
+        Hard reclamation of all physical resources.
+        Unlinks Shared Memory and closes IPC handles.
+        """
+        if self._cleaned:
+            return # Prevent double-cleanup noise
 
-        # 1. SOFT KILL: Tell all workers via SHM to stop immediately (-3)
-        if self.ctx_store:
-            try:
-                self.ctx_store.set_shutdown()
-                print("   - SHM State set to SHUTDOWN (-3)")
-            except Exception as e:
-                print(f"   ⚠️ Could not set SHM shutdown state: {e}")
+        print("\n[EngineResources] Cleaning up all resources...")
 
-        # 2. WAIT: Give workers a brief moment (e.g., 1 second) to see the SHM signal
-        # and release their own file locks/resources gracefully.
-        import time
-        time.sleep(1.0)
+        # 1. THE NUCLEAR STEP: Close the ExitStack
+        # This triggers all .unlink() and .close() callbacks registered
+        # during setup_engine().
+        try:
+            print("   - Unlinking IPC and Shared Memory segments...")
+            self.stack.close()
+        except Exception as e:
+            print(f"   ⚠️ Warning during resource unlinking: {e}")
 
-        # 3. HARD KILL: Terminate any workers that are deadlocked or didn't listen
-        print("   - Terminating remaining worker processes...")
-        for proc in self.reader_procs + self.renderer_procs + [self.writer_proc]:
-            if proc and proc.is_alive():
-                # Try to join them first
-                proc.join(timeout=0.5)
-                # If still alive, force terminate
-                if proc.is_alive():
-                    proc.terminate()
+        # 2. REFERENCE CLEARING
+        # Physically remove the pointers to the now-deleted resources.
+        # This ensures that any subsequent call to 'getattr' or 'self.pool_map'
+        # will fail with a clear error or return None, rather than hitting
+        # a closed OS handle.
+        self.pool_map.clear()
+        self.output_pool = None
+        self.registry = None
+        self.ctx_store = None
 
-        # 4. UNLINK: Close queues and unlink SHM segments via ExitStack
-        print("   - Unlinking IPC and Shared Memory...")
-        self.stack.close()
-        print("✅ [EngineResources] Shutdown Complete.")
+        # Clear queue references
+        self.status_q = None
+        self.read_q = None
+        self.work_q = None
+        self.writer_q = None
+
+        self._cleaned = True
+        print("✅ [EngineResources] Cleanup complete.")
 
 
 def calculate_shm_partitions(

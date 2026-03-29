@@ -1,5 +1,6 @@
 import json
 import os
+from queue import Empty
 import socket
 
 from Common.ipc_packets import Envelope, Op
@@ -79,6 +80,11 @@ def client_rcv_loop(socket_path: str, status_queue):
                                 op=Op.ERROR, payload=(-1, "SOCKET", "Malformed JSON received")
                             )
                         )
+                    except (Empty, socket.timeout):
+                        continue
+                    except (OSError, ValueError):
+                        # 3. If the Orchestrator closes the queue/socket, exit quietly
+                        break
                     except Exception as e:
                         print(f"[command_rcv] Receive err {e}")
 
@@ -91,6 +97,7 @@ def client_rcv_loop(socket_path: str, status_queue):
 
             # If we reach here, the Client disconnected.  # The loop continues to server.accept()
             # to wait for a new connection.
+
 
     finally:
         server.close()

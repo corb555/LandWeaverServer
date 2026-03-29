@@ -1,4 +1,5 @@
 import multiprocessing
+import signal
 import sys
 import traceback
 from typing import Optional
@@ -14,23 +15,19 @@ from Render.task_routines import write_task, read_task, render_task, RenderWorks
 
 
 # job_loops.py
+def process_setup(shm_name):
+    # Create a unique process name
+    setproctitle.setproctitle(multiprocessing.current_process().name)
 
+    #Ignore keyboard interrupts.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-def load_reader_job_ctx(job_id: str, shm_store: JobContextStore) -> ReaderContext:
-    """Load the reader context for a specific job from shared job storage."""
-    try:
-        return shm_store.get_reader_context(job_id)
-    except Exception as exc:
-        raise RuntimeError(
-            f"[READER] Failed to load ReaderContext for job '{job_id}': {exc}"
-        ) from exc
-
+    # Return shared memory
+    return JobContextStore(name=shm_name)
 
 def reader_loop(read_q, status_q, shm_name: str, pool_map) -> None:
     section = "READER"
-    setproctitle.setproctitle(multiprocessing.current_process().name)
-
-    shm_store = JobContextStore(name=shm_name)
+    shm_store = process_setup(shm_name)
     ctx: Optional[ReaderContext] = None
 
     while True:
@@ -40,7 +37,7 @@ def reader_loop(read_q, status_q, shm_name: str, pool_map) -> None:
         if envelope.op == Op.LOAD_BLOCK:
             packet = envelope.payload
 
-            # 1. System Sync (Authoritative state check)
+            # 1. System Sync (Global state check)
             ctx = sync_ctx_for_packet(
                 ctx=ctx, packet_job_id=packet.job_id, shm_store=shm_store,
                 load_ctx=load_reader_job_ctx, err_prefix=section
@@ -94,6 +91,14 @@ def reader_loop(read_q, status_q, shm_name: str, pool_map) -> None:
             finally:
                 close_worker_ctx(ctx)
 
+def load_reader_job_ctx(job_id: str, shm_store: JobContextStore) -> ReaderContext:
+    """Load the reader context for a specific job from shared job storage."""
+    try:
+        return shm_store.get_reader_context(job_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"[READER] Failed to load ReaderContext for job '{job_id}': {exc}"
+        ) from exc
 
 def load_worker_job_ctx(job_id: str, shm_store: JobContextStore) -> WorkerContext:
     """Load the worker context for a specific job from shared job storage."""
@@ -106,9 +111,7 @@ def load_worker_job_ctx(job_id: str, shm_store: JobContextStore) -> WorkerContex
 
 
 def render_loop(work_q, writer_q, status_q, shm_name, out_pool, pool_map):
-    setproctitle.setproctitle(multiprocessing.current_process().name)
-
-    shm_store = JobContextStore(name=shm_name)
+    shm_store = process_setup(shm_name)
     ctx: Optional[WorkerContext] = None
     workspace = RenderWorkspace()
 
@@ -116,22 +119,19 @@ def render_loop(work_q, writer_q, status_q, shm_name, out_pool, pool_map):
         envelope = work_q.get()
         packet = envelope.payload
         section = "sync ctx"
-
-        #  STATE TRANSLATION: Sync SHM and check for Cancel/Idle/Stale
-        ctx = sync_ctx_for_packet(
-            ctx=ctx, packet_job_id=packet.job_id, shm_store=shm_store, load_ctx=load_worker_job_ctx,
-            err_prefix="WORKER"
-        )
-        if ctx is None: continue
-
-        # ENGINE TRANSLATION: Rebuild math engines if config changed
-        workspace.sync_to_context(ctx)
-
         try:
             match envelope.op:
                 case Op.RENDER_TILE:
                     try:
-                        section = "rnder task"
+                        ctx = sync_ctx_for_packet(
+                        ctx=ctx, packet_job_id=packet.job_id, shm_store=shm_store, load_ctx=load_worker_job_ctx,
+                        err_prefix="WORKER"
+                        )
+                        if ctx is None: continue
+
+                        # ENGINE TRANSLATION: Rebuild math engines if config changed
+                        workspace.sync_to_context(ctx)
+                        section = "task"
                         result = render_task(
                             packet=packet, ctx=ctx, workspace=workspace, out_pool=out_pool,
                             pool_map=pool_map
@@ -140,8 +140,8 @@ def render_loop(work_q, writer_q, status_q, shm_name, out_pool, pool_map):
                     except (ValueError, OSError, KeyError) as e:
                         # SEV_CANCEL: Notify Orch, but STAY in the while loop
                         payload = ErrorPacket(
-                            job_id=packet.job_id, tile_id=-1, section="wrn", severity=SEV_CANCEL,
-                            message=f"Render {section} err='{e}'"
+                            job_id=packet.job_id, tile_id=-1, section="", severity=SEV_CANCEL,
+                            message=f"Render {section} error: '{e}'"
                         )
                         send_error(status_q, payload)
                     except Exception as e:
@@ -199,9 +199,8 @@ def load_writer_job_ctx(job_id: str, shm_store: JobContextStore) -> WriterContex
 
 def writer_loop(write_q, status_q, shm_name: str, out_pool) -> None:
     section = "WRITER"
-    shm_store = JobContextStore(name=shm_name)
+    shm_store = process_setup(shm_name)
     ctx: Optional[WriterContext] = None
-    setproctitle.setproctitle(multiprocessing.current_process().name)
 
     try:
         while True:

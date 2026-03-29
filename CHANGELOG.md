@@ -1,5 +1,6 @@
 # Changelog
 
+- 1.9 [STABILITY] Added detailed render config verification
 - 1.8 [FEAT] Added ability to add/delete pipeline steps without restarting pipeline
 - 1.7 [STABILITY] Refactored project into a Pipeline package, Render Package and a Common package.
 - 1.6 [STABILITY] Better SHM partitioning and deterministic memory scaling. Fixed parameter passing.

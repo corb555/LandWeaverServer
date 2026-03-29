@@ -204,7 +204,7 @@ processing
 THere is a detailed design spec for this.
 
 * **Phase 0 (Visibility): DONE** Forwarding `ErrorPackets` from workers to the Client UI.
-* **Phase 1 (Foundation): DONE** Authoritative Job IDs in SHM (`-3` Shutdown, `-2` Cancel, `-1` Idle, `N` Active).
+* **Phase 1 (Foundation): DONE** Global Job IDs in SHM (`-3` Shutdown, `-2` Cancel, `-1` Idle, `N` Active).
 * **Phase 2 (Active Handshake):** Orchestrator `CANCELLING` state; Writer acknowledges with `WRITER_ABORTED` after
   unlinking `.tmp` files. Add States in pipeline.
 * **Phase 3 (Watchdog):** Deadlock detection with tiered timeouts (Worker 7s / Orchestrator 10s).

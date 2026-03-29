@@ -48,7 +48,7 @@ def sync_ctx_for_packet(
     """
     shm_job_id = shm_store.get_job_id()
 
-    # --- RULE 0: Authoritative State Check ---
+    # --- RULE 0: Global State Check ---
     # If SHM says we are in a non-active state (Idle=-1, Cancel=-2, Shutdown=-3),
     # we must immediately stop processing and release resources.
     try:

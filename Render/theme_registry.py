@@ -118,14 +118,9 @@ class ThemeRegistry:
         self._build_runtime_specs(render_cfg)
 
     def _build_runtime_specs(self, render_cfg: Any) -> None:
-
         categories_cfg = self._extract_theme_category_config(render_cfg)
         smoothing_cfg = self._extract_smoothing_config(render_cfg)
         modifiers_cfg = getattr(render_cfg, "modifiers", {}) or {}
-
-        # DEBUG
-        thr = getattr(render_cfg, "theme_render", {}) or {}
-        ct = thr.get("categories")
 
         for label, cat_cfg in categories_cfg.items():
             enabled = cat_cfg.get("enabled", True)
@@ -169,45 +164,32 @@ class ThemeRegistry:
                     surface_shift_vector=tuple(float(v) for v in surface_shift_vector),
                     enabled=bool(enabled), )
             except MemoryError as e:
-                print(f"Config error for theme_render:categories:{label} - {e}")
-                raise ValueError(f"Config error for theme_render:categories:{label} - {e}")
+                print(f"Config error for theme_render:{label} - {e}")
+                raise ValueError(f"Config error for theme_render:{label} - {e}")
 
             self._runtime_specs_by_label[label] = spec
             self._runtime_specs_by_id[theme_id] = spec
-            # self.brs_count += 1
-            """if label == "playa":
-                print(
-                    f"DEBUG build runt '{label}' spec:",
-                    f"noise_amp={spec.noise_amp}, "
-                    f"contrast={spec.contrast}, "
-                    f"max_opacity={spec.max_opacity}, "
-                    f"noise_id={spec.noise_id}"
-                )"""
 
     # theme_registry.py
 
     def _extract_theme_category_config(self, render_cfg: Any) -> Dict[str, Any]:
         """
-        Force the registry to look at the structured attributes
-        of the RenderConfig object first.
+        Extracts theme settings directly from the theme_render block.
+        Filters out metadata keys by checking against known QML labels.
         """
-        # 1. Check the structured attribute (Promoted by RenderConfig.load)
+        # 1. Get the structured attribute
         theme_render = getattr(render_cfg, "theme_render", {})
-        if theme_render:
-            categories = theme_render.get("categories", {})
-            if categories:
-                return dict(categories)
 
-        # 2. Fallback to the raw dict (Direct from YAML)
-        raw_defs = getattr(render_cfg, "raw_defs", {})
-        categories = raw_defs.get("theme_render", {}).get("categories")
-        if categories:
-            return categories
+        if not theme_render:
+            return {}
 
-        # 3. Final Fallback (The source of your 3-week stale data!)
-        # If theme_render isn't found, it uses 'logic', which hasn't changed.
-        return {label: params for label, params in raw_defs.get("logic", {}).items() if
-                label in self._name_to_id}
+        # 2. Filter: Only return keys that are actual categories defined in QML.
+        # This allows you to have keys like 'source_driver' or 'version' in
+        # the same block without the spec-builder trying to render them.
+        return {
+            label: params for label, params in theme_render.items()
+            if label in self._name_to_id
+        }
 
     @staticmethod
     def _extract_smoothing_config(render_cfg: Any) -> Dict[str, Mapping[str, Any]]:
@@ -359,8 +341,8 @@ def refine_organic_signal_b(
     """
     signal = mask.astype(np.float32)
 
-    if spec.label == "playa":
-        print(f"ROSB {spec.label} opa={spec.max_opacity}")
+    #DEBUG if spec.label == "playa":
+    #    print(f"ROSB {spec.label} opa={spec.max_opacity}")
 
     if spec.blur_px > 0.0:
         signal = gaussian_filter(signal, sigma=spec.blur_px)

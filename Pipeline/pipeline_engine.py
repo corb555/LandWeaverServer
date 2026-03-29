@@ -6,6 +6,7 @@ from pathlib import Path
 from queue import Empty
 import time
 import traceback
+from types import SimpleNamespace
 from typing import List, Callable, Optional, TypeAlias, Counter
 
 from rasterio.windows import Window
@@ -20,7 +21,7 @@ from Pipeline.render_stack import RenderStack
 from Pipeline.system_config import SystemConfig
 from Pipeline.tile_dispatcher import TileDispatcher, DispatchResult
 
-from Render.render_config import derive_resources, RenderConfig
+from Render.render_config import derive_resources, RenderConfig, analyze_pipeline
 
 EnvelopeHandler: TypeAlias = Callable[[Envelope], None]
 
@@ -74,7 +75,7 @@ class PipelineOrchestrator:
 
         # Command dispatch table
         self._dispatch: dict[Op, EnvelopeHandler] = {
-            Op.JOB_REQUEST: self._handle_job_request, Op.SHUTDOWN: self._handle_shutdown,
+            Op.JOB_REQUEST: self._handle_job_request, Op.SHUTDOWN: self._initiate_shutdown,
             Op.BLOCK_LOADED: self._handle_block_loaded, Op.TILE_WRITTEN: self._handle_tile_written,
             Op.TILES_FINALIZED: self._handle_tiles_finalized, Op.ERROR: self._handle_error,
             Op.WRITER_ABORTED: self._handle_wr_abort,
@@ -93,6 +94,7 @@ class PipelineOrchestrator:
                 except Empty:
                     # Heartbeat check (Phase 3 of your Tock strategy)
                     # TODO self._check_for_deadlocks()
+
                     self._pulse_client_progress()
                     continue
 
@@ -103,7 +105,7 @@ class PipelineOrchestrator:
 
             except KeyboardInterrupt:
                 print("🛑 User initiated shutdown (Ctrl+C)")
-                self._initiate_emergency_shutdown("User Interruption")
+                self._initiate_shutdown("User Interruption")
                 break
 
             except Exception as e:
@@ -125,10 +127,10 @@ class PipelineOrchestrator:
                 # C. Resource Reclamation
                 # This is the most important part. Tell workers to die
                 # and unlink the SHM segments so the OS stays clean.
-                self._initiate_emergency_shutdown(f"System Error: {e}")
+                self._initiate_shutdown(f"System Error: {e}")
 
                 # D. Exit the loop
-                self.running = False
+                break
 
     def _handle_job_request(self, envelope: Envelope) -> None:
         """Queue a new job request and start it if no job is active."""
@@ -141,18 +143,62 @@ class PipelineOrchestrator:
         if not self.job_control.busy:
             self._start_next_job()
 
-    def _initiate_emergency_shutdown(self, reason: str):
-        """Emergency cleanup to prevent zombie processes and SHM leaks."""
-        # 1. Set the Job ID to -3 (SHUTTING_DOWN)
-        self.eng_resources.ctx_store.set_shutdown()
+    def _initiate_shutdown(self, reason: str):
+            """ cleanup to prevent zombie processes and SHM leaks."""
+            eng = self.eng_resources
+            print(f"\n [Orchestrator] Shutdown Initiated: {reason}")
 
-        # 2. Send Poison Pills (N readers, N workers, 1 writer)
-        # Follow the order: Reader -> Renderer -> Writer
-        print(f"Sending poison pills to workers... Reason: {reason}")
-        # TODO logic to put Op.SHUTDOWN in all queues ...
+            # 1. Global shutdown Signal
+            # This acts as a circuit breaker for workers currently processing a tile.
+            if eng.ctx_store:
+                try:
+                    eng.ctx_store.set_shutdown()
+                    print("   - Global State set to SHUTDOWN ")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to set  shutdown state: {e}")
 
-        # 3. Clean up Orchestrator's internal SHM handles
-        self.eng_resources.cleanup_all_shm()
+            # 2. Sequential Poison Pill Injection
+            # We must send one SHUTDOWN packet per process in each pool.
+            print("   - Dispatching poison pills to worker queues...")
+
+            # Reader Pills
+            for _ in eng.reader_procs:
+                self.send_to_worker("read_q", Envelope(op=Op.SHUTDOWN, payload=None))
+
+            # Renderer Pills
+            for _ in eng.renderer_procs:
+                self.send_to_worker("work_q", Envelope(op=Op.SHUTDOWN, payload=None))
+
+            # Writer Pill (Only 1 writer)
+            if eng.writer_proc:
+                self.send_to_worker("writer_q", Envelope(op=Op.SHUTDOWN, payload=None))
+
+            # 3. Graceful Join with Forceful Fallback
+            # We give the processes a moment to see the pill and close their own handles.
+            all_procs = eng.reader_procs + eng.renderer_procs + [eng.writer_proc]
+
+            print("   - Waiting for processes to exit...")
+            for proc in all_procs:
+                if proc is None:
+                    continue
+
+                if proc.is_alive():
+                    # Wait 1.0s for the process to exit cleanly via its loop logic
+                    proc.join(timeout=1.0)
+
+                    # If still alive after timeout, it's deadlocked; force a hard kill
+                    if proc.is_alive():
+                        print(f"   ⚠️ Process {proc.name} unresponsive. Force terminating...")
+                        proc.terminate()
+                        proc.join(timeout=0.2) # Final join to clean up resources
+
+            # 4. Physical Resource Reclamation
+            # Unlink all SHM segments and close queues via the ExitStack logic
+            print("   - Unlinking Shared Memory and closing IPC...")
+            eng.cleanup()
+
+            print("✅ [Orchestrator] System Purge Complete. Daemon Halted.")
+            self.running = False
 
     def showtime(self, msg):
         wall_start = datetime.now()
@@ -176,20 +222,74 @@ class PipelineOrchestrator:
             job_manifest = self.resolver.create_job_manifest(json_job_req)
             job_id = job_manifest.job_id
 
-            # 2. VALIDATE SYSTEM RESOURCES
-            # Ensure our  pools match what this render requires
-            needs_rebuild = False
-            required = set(job_manifest.resources.drivers.keys())
-            allocated = set(self.eng_resources.pool_map.keys())
-            if not required.issubset(allocated):
-                print(f"🔄 [Orchestrator] Driver Mismatch. Rebuilding for: {required - allocated}")
-                needs_rebuild = True
+            # 1. THE PHYSICAL CONTRACT CHECK
+            # What the Biome logic requires:
+            required_drivers = set(job_manifest.resources.drivers.keys())
+
+            # What the Engine allocated at boot:
+            allocated_pools = set(self.eng_resources.pool_map.keys())
+
+            if not required_drivers.issubset(allocated_pools):
+                missing = required_drivers - allocated_pools
+
+                # ERROR: There is a configuration mismatch between the Render config and the Engine
+                missing_sorted = ", ".join(sorted(missing))
+
+                error_msg = (
+                    f"⚠️ Job: {job_id} - Missing driver configuration\n"
+                    f"This render requires driver(s) that are not available in the current "
+                    f"engine configuration.\n"
+                    f"Missing: {missing_sorted}\n"
+                    f"To fix this, add the missing driver(s) to 'engine_config.yml' under "
+                    f"'driver_specs', then restart Thematic Render."
+                )
+
+                # Report to Client and Abort
+                self._send_to_client({
+                    "msg": "error", "job_id": job_id, "severity": 1,
+                    "message": error_msg
+                })
+                print(f"⚠️ J{error_msg}")
+
+                self.job_control.clear_job()
+                self._start_next_job() # Skip to next pending
+                return False
+
+            # 3. LOGICAL PIPELINE AUDIT (The "Airlock" Check)
+            # Create a lightweight context for the analyzer
+            audit_ctx = SimpleNamespace(
+                render_cfg=job_manifest.render_cfg,
+                eng_resources=self.eng_resources,
+                theme_registry=self.render_stack.theme_reg,
+                anchor_key=job_manifest.resources.anchor_key
+            )
+
+            has_errors, report_md, raw_errors = analyze_pipeline(audit_ctx)
+
+            if has_errors:
+
+                # Build concise summary for the UI
+                error_summary = "\n".join([f"• {err}" for err in raw_errors[:2]])
+                if len(raw_errors) > 2:
+                    error_summary += f"\n...and {len(raw_errors) - 2} more errors."
+
+                final_msg = f"⚠️ Render config errors:\n{error_summary}"
+                print(f"⚠️ [Orchestrator] Job  '{job_id}' {final_msg}")
+
+                self._send_to_client({
+                    "msg": "error",
+                    "job_id": job_id,
+                    "severity": 1, # SEV_CANCEL
+                    "message": final_msg,
+                    "report": report_md # Client can display full Markdown if supported
+                })
+                return self._skip_to_next_job()
 
             self.eng_resources.sync_to_geography(job_manifest.region_id)
 
             # 3. INIT RENDER ENGINES
             # Boot the render engines if they are cold or if drivers changed
-            if needs_rebuild or self.render_stack.factor_eng is None:
+            if  self.render_stack.factor_eng is None:
                 self.render_stack.init_render_engines(
                     job_manifest.render_cfg, job_manifest.resources, self.eng_resources
                 )
@@ -236,19 +336,24 @@ class PipelineOrchestrator:
             return True
 
         except Exception as e:
-            traceback.print_exc()
+            #traceback.print_exc()
             print(f"⚠️ [ORCHESTRATOR] Job '{job_id}' Failed to start: {e}")
 
             self._send_to_client(
                 {
                     "msg": "error", "job_id": job_id, "severity": 1,  # SEV_CANCEL
-                    "message": f"⚠️ Job Initialization Failed: {str(e)}"
+                    "message": f"⚠️ Job Initialization error: {str(e)}"
                 }
             )
 
             self.job_control.clear_job()
             self._start_next_job()  # Attempt next job in queue
             return False
+
+    def _skip_to_next_job(self) -> bool:
+        """Helper to clear state and attempt the next job in queue."""
+        self.job_control.clear_job()
+        return self._start_next_job()
 
     def _handle_tiles_finalized(self, envelope: Envelope) -> None:
         """Publish the finalized temp file and notify the client."""
@@ -455,11 +560,11 @@ class PipelineOrchestrator:
         """Fallback handler for unregistered OpCodes."""
         self.stats.unknown_ops += 1
         print(f"⚠️ [Orchestrator] ERROR: Unknown OpCode: {envelope.op}")
-        self._handle_shutdown(envelope)
+        self._initiate_shutdown(" ")
 
     def _handle_job_cancel(self, envelope: Envelope) -> None:
         print(f"⚠️ [Orchestrator] Job Cancel : {envelope.op}")
-        # 1. Authoritative SHM Flip (Interruption)
+        # 1. Global SHM Flip (Interruption)
         self.eng_resources.cancel_active_job()
 
         # 2. Pipeline Signaling (Cleanup)
@@ -468,10 +573,8 @@ class PipelineOrchestrator:
         # 3. Logic cleanup
         self.job_control.clear_job()
 
-    @staticmethod
-    def _handle_wr_abort(envelope: Envelope) -> None:
-        # TODO Implement error handling 2.2
-        print(f"⚠️ [Orchestrator] Writer Abort not implemented: {envelope.op}")
+    def _handle_wr_abort(self, envelope: Envelope) -> None:
+        self._initiate_shutdown()
 
     def valid_job_id(self, job_id):
         valid = job_id == self.job_control.job_id
@@ -524,54 +627,67 @@ class PipelineOrchestrator:
                 self.eng_resources.cancel_active_job()
 
                 # Local cleanup and state reset
-                # tODO self._unlink_file_if_exists(self.job_control.temp_out_path)
                 self.job_control.clear_job()
-
-                # Note: We do NOT automatically call _start_next_job() here  # to allow the  #  #
-                # developer to inspect the failure state.
 
         elif sev == SEV_FATAL:
             # Severity 0: The system is in an unrecoverable state
-            print("🚨 FATAL ERROR: Initiating emergency system shutdown.")
-            self._handle_shutdown(envelope)
-
-    def _handle_shutdown(self, _envelope: Envelope) -> None:
-        """Stop the event loop and discard any active temp output."""
-        # TODO Implement 2.1 Shutdown
-        if self.job_control.busy:
-            packet = JobDonePacket(job_id=self.job_control.job_id)
-            self.send_to_worker('writer_q', Envelope(op=Op.SHUTDOWN, payload=packet))
-            self._unlink_file_if_exists(self.job_control.temp_out_path)
-
-        self.running = False
-        print("🛑 [Orchestrator] Shutting Down.")
+            print(" FATAL ERROR: Initiating emergency system shutdown.")
+            self._initiate_shutdown(" FATAL ERROR: Initiating emergency system shutdown.")
 
     def send_to_worker(self, queue_attr: str, envelope: Envelope) -> None:
-        """
-        Centrally managed 'put' for all worker queues with state logging.
-        queue_attr: 'read_q', 'work_q', or 'writer_q'
-        """
-        # 1.  Queue Put
-        queue = getattr(self.eng_resources, queue_attr)
-        queue.put(envelope)
+            """
+            Hardened IPC dispatch for worker queues with fault detection.
+            """
+            # 1. DEFENSIVE QUEUE LOOKUP
+            # getattr is safe, but we must ensure the attribute exists and isn't None
+            queue = getattr(self.eng_resources, queue_attr, None)
+            if queue is None:
+                print(f"⚠️ [SEND_ERROR] Target queue '{queue_attr}' is not initialized.")
+                return
 
-        # 2. Update Stats
-        payload = envelope.payload
-        tile_id = getattr(payload, 'tile_id', '-')
-        job_id = getattr(payload, 'job_id', self.job_control.job_id)
+            # 2. THE HARDENED 'PUT'
+            try:
+                # We use a non-blocking put or a very short timeout to detect
+                # deadlocked queues, but for this architecture, a standard put
+                # wrapped in exception handling is usually the 'Fact-Based' choice.
+                queue.put(envelope)
+            except (OSError, ValueError, BrokenPipeError) as e:
+                # This happens if the queue was closed by another process
+                # or the system is halfway through a shutdown.
+                print(f"❌ [IPC FAILURE] Cannot send to {queue_attr}: {e}")
+                # If the system is supposed to be running, this is a fatal logic error
+                if self.running:
+                    self._initiate_shutdown(f"IPC Channel {queue_attr} collapsed.")
+                return
 
-        # 3. Capture Current Orchestrator State
-        pending_jobs = len(self.pending_jobs)
-        in_flight = len(self.dispatcher.active_tiles)
+            # 3. DEFENSIVE METADATA EXTRACTION
+            # We must assume self.job_control or envelope.payload could be None
+            # during edge-case state transitions (like a shutdown).
+            payload = envelope.payload
+            tile_id = getattr(payload, 'tile_id', '-')
 
-        prog_str = f"{self.job_control.tiles_written}/{self.job_control.total_tiles}"
+            # Safe Job ID fallback
+            job_id = "N/A"
+            if payload and hasattr(payload, 'job_id'):
+                job_id = payload.job_id
+            elif self.job_control:
+                job_id = self.job_control.job_id
 
-        # 4. Print Multi-line Visibility Block
-        if True:
+            # 4. SAFE STATE CAPTURE
+            pending_jobs = len(self.pending_jobs)
+            in_flight = len(self.dispatcher.active_tiles) if self.dispatcher else 0
+
+            # Calculate progress only if job_control is active
+            if self.job_control:
+                prog_str = f"{self.job_control.tiles_written}/{self.job_control.total_tiles}"
+            else:
+                prog_str = "IDLE"
+
+            # 5. VISIBILITY (Using the existing dbg helper)
             dbg(
                 f" >>> [SEND] Q: {queue_attr:8} | OP: {envelope.op.name:15} | TILE: {tile_id:<5} | "
-                f"JOB: {job_id}"
-                f" [STATE] In-Flight: {in_flight:<3} | Pending Jobs: {pending_jobs:<2} | "
+                f"JOB: {job_id:10} | "
+                f"[STATE] In-Flight: {in_flight:<3} | Pending: {pending_jobs:<2} | "
                 f"Progress: {prog_str}", tile_id
             )
 
@@ -652,13 +768,16 @@ class JobResolver:
         try:
             render_cfg = self.config_loader(config_path)
 
+        except Exception as e:
+            raise ValueError(f"Render Config syntax error: {str(e)}")
+        try:
             render_cfg.resolve_paths(
                 prefix=params.get("prefix", ""),
                 build_dir=Path(params.get("build_dir", "build")).expanduser(),
                 output_file=params.get("output_file", "output.tif")
             )
         except Exception as e:
-            raise ValueError(f"YAML Syntax or Path error: {str(e)}")
+            raise ValueError(f"Render Config error: {str(e)}")
 
         # 3. GET HASHES - used to detect what part of config has changed
         hashes = render_cfg.get_hashes()
@@ -705,7 +824,7 @@ class JobResolver:
                         )
                         write_offset = (int(envelope.row_off), int(envelope.col_off))
         except Exception as e:
-            raise IOError(f"Could not open source files: {str(e)}")
+            raise IOError(f"Could not open file: {str(e)}")
 
         # 5. Add hashes
         resources = resources.with_hashes(

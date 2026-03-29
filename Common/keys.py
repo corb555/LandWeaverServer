@@ -60,9 +60,11 @@ class ConfigView(Protocol):
 class FactorSpec:
     name: str
     function_id: str
-    drivers: FrozenSet[DriverKey] = frozenset()
+
+    # Use Tuple allow indexing [0]
+    drivers: Tuple[str, ...] = field(default_factory=tuple)
+    files: Tuple[str, ...] = field(default_factory=tuple)
     required_factors: Tuple[str, ...] = field(default_factory=tuple)
-    files: FrozenSet[FileKey] = frozenset()
     required_noise: Optional[str] = None
     desc: str = ""
     params: Dict[str, Any] = field(default_factory=dict)
