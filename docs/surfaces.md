@@ -57,8 +57,7 @@ High-contrast green with micro-detail to simulate tree crowns and shadows.
 ```python
 NoiseProfile(id="forest_crunch", sigmas=(0.5, 1.5, 5.0), weights=(0.5, 0.3, 0.2))
 HueVariationProfile(
-    intensity=25.0, 
-    shift_vector=(-0.4, 1.0, -0.2), # Bright Green peaks, Dark/Brown valleys
+    intensity=25.0, shift_vector=(-0.4, 1.0, -0.2),  # Bright Green peaks, Dark/Brown valleys
     noise_id="forest_crunch"
 )
 ```
@@ -70,8 +69,7 @@ Warm, broad organic staining to simulate mineral deposits in desert soil.
 ```python
 NoiseProfile(id="biome", sigmas=(1.0, 4.0, 12.0), weights=(0.3, 0.4, 0.3))
 HueVariationProfile(
-    intensity=15.0, 
-    shift_vector=(1.0, 0.7, 0.3), # Shifts toward Red/Yellow sandstone tones
+    intensity=15.0, shift_vector=(1.0, 0.7, 0.3),  # Shifts toward Red/Yellow sandstone tones
     noise_id="biome"
 )
 ```
@@ -83,8 +81,7 @@ Stretched noise to simulate sedimentary layering.
 ```python
 NoiseProfile(id="strata", sigmas=(2.0, 10.0), weights=(0.5, 0.5), stretch=(1.0, 8.0))
 HueVariationProfile(
-    intensity=18.0, 
-    shift_vector=(0.2, 0.2, 0.2), # Neutral grey/brown grit
+    intensity=18.0, shift_vector=(0.2, 0.2, 0.2),  # Neutral grey/brown grit
     noise_id="strata"
 )
 ```
@@ -96,8 +93,7 @@ A subtle, high-frequency grit to make the entire map feel like physical media.
 ```python
 NoiseProfile(id="grit", sigmas=(0.5, 0.8), weights=(0.8, 0.2))
 HueVariationProfile(
-    intensity=6.0, 
-    shift_vector=(-1.0, -1.0, -1.0), # Subtle dark "pits" in the paper
+    intensity=6.0, shift_vector=(-1.0, -1.0, -1.0),  # Subtle dark "pits" in the paper
     noise_id="grit"
 )
 ```

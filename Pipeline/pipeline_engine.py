@@ -20,7 +20,6 @@ from Pipeline.job_control import JobControl, JobManifest
 from Pipeline.render_stack import RenderStack
 from Pipeline.system_config import SystemConfig
 from Pipeline.tile_dispatcher import TileDispatcher, DispatchResult
-
 from Render.render_config import derive_resources, RenderConfig, analyze_pipeline
 
 EnvelopeHandler: TypeAlias = Callable[[Envelope], None]
@@ -36,32 +35,29 @@ class PipelineEngine:
         self.client_proxy = None
         resolver = JobResolver(config_loader=lambda p: RenderConfig.load(p))
         render_stack = RenderStack()
-        self.engine_cfg = SystemConfig.load_engine_specs(system_yml_path)
-        self.eng_resources: EngineResources = EngineResources(self.engine_cfg)
+        engine_cfg = SystemConfig.load_engine_specs(system_yml_path)
+        self.eng_resources = EngineResources(engine_cfg)
         io_system: IOSystem = IOSystem()
         dispatcher = TileDispatcher(resources=self.eng_resources, max_in_flight=10)
-
+        self.client_proxy = ClientProxy(
+            engine_cfg.get("system.socket_path"), status_q=self.eng_resources.status_q,
+            response_q=self.eng_resources.response_q
+        )
         self.orchestrator = PipelineOrchestrator(
-                eng_resources=self.eng_resources,
-                io_system=io_system,
-                dispatcher=dispatcher,
-                resolver=resolver,
-                render_stack=render_stack
-            )
+            eng_resources=self.eng_resources, io_system=io_system, dispatcher=dispatcher,
+            resolver=resolver, render_stack=render_stack
+        )
 
     def start(self):
-        self.eng_resources.setup_engine()
-        self.client_proxy = ClientProxy(
-            socket_path=self.engine_cfg.get("system.socket_path"),
-            status_q=self.eng_resources.status_q, response_q=self.eng_resources.response_q
-        )
+        self.eng_resources.start()
         self.client_proxy.start()
-        self.orchestrator.run_loop()
+        self.orchestrator.loop()
 
 
 class PipelineOrchestrator:
     def __init__(self, eng_resources, io_system, dispatcher, resolver, render_stack):
         self.last_activity_ts = None
+        self.previous_ts = None
         self.eng_resources = eng_resources
         self.resolver = resolver
         self.render_stack = render_stack
@@ -69,7 +65,6 @@ class PipelineOrchestrator:
         self.dispatcher = dispatcher
         self.stats = JobTelemetry()
         self.last_progress_pulse = 0.0
-        self.previous_ts = 0
         self.pending_jobs: List[dict] = []
         self.job_control: JobControl = JobControl()
 
@@ -83,22 +78,20 @@ class PipelineOrchestrator:
 
         self.running = True
 
-    def run_loop(self) -> None:
-
+    def loop(self) -> None:
         while self.running:
             try:
-                # 1. THE INGESTION PHASE
+                # 1.  INGESTION
                 try:
                     envelope: Envelope = self.eng_resources.status_q.get(timeout=0.05)
                     self.last_activity_ts = time.perf_counter()  # Reset watchdog
                 except Empty:
                     # Heartbeat check (Phase 3 of your Tock strategy)
                     # TODO self._check_for_deadlocks()
-
                     self._pulse_client_progress()
                     continue
 
-                # 2. THE DISPATCH PHASE
+                # 2.  DISPATCH
                 self.update_telemetry(envelope.op)
                 self._dispatch.get(envelope.op, self._handle_unknown_op)(envelope)
                 self._pulse_client_progress()
@@ -110,13 +103,11 @@ class PipelineOrchestrator:
 
             except Exception as e:
                 # Something went wrong in the Orchestrator logic itself.
-
                 # A. High-Fidelity Logging
                 print(f"\n CRITICAL ORCHESTRATOR FAILURE")
                 traceback.print_exc()
 
                 # B. Notify the Client
-                # Don't leave the Editor UI spinning forever
                 self._send_to_client(
                     {
                         "msg": "error", "job_id": "system", "severity": 0,
@@ -125,235 +116,187 @@ class PipelineOrchestrator:
                 )
 
                 # C. Resource Reclamation
-                # This is the most important part. Tell workers to die
-                # and unlink the SHM segments so the OS stays clean.
                 self._initiate_shutdown(f"System Error: {e}")
 
                 # D. Exit the loop
                 break
 
     def _handle_job_request(self, envelope: Envelope) -> None:
-        """Queue a new job request and start it if no job is active."""
+        """Queue a new job request. Start it if no job is active."""
         data = envelope.payload
 
         # Queue job
         self.pending_jobs.append(data)
 
-        # Immediately run it if we're not busy
+        # Immediately run it if we're not busy.
         if not self.job_control.busy:
             self._start_next_job()
 
-    def _initiate_shutdown(self, reason: str):
-            """ cleanup to prevent zombie processes and SHM leaks."""
-            eng = self.eng_resources
-            print(f"\n [Orchestrator] Shutdown Initiated: {reason}")
+    def _start_next_job(self) -> None:
+        """
+        Starts the next valid queued job.
+        Walks thru the queue until it finds a job that can start
+        """
+        while self.pending_jobs:
+            json_job_req = self.pending_jobs.pop(0)
+            job_id = json_job_req.get("job_id", "unknown")
 
-            # 1. Global shutdown Signal
-            # This acts as a circuit breaker for workers currently processing a tile.
-            if eng.ctx_store:
-                try:
-                    eng.ctx_store.set_shutdown()
-                    print("   - Global State set to SHUTDOWN ")
-                except Exception as e:
-                    print(f"   ⚠️ Failed to set  shutdown state: {e}")
+            try:
+                job_manifest = self._prepare_manifest(json_job_req)
+            except ValueError as exc:
+                print(f"Job {job_id} error: {exc}")
+                self._send_to_client(
+                    {
+                        "msg": "error", "job_id": job_id, "severity": 1, "message": str(exc),
+                        "report": "",
+                    }
+                )
+                continue
+            self._launch_job(job_manifest)
+            return
 
-            # 2. Sequential Poison Pill Injection
-            # We must send one SHUTDOWN packet per process in each pool.
-            print("   - Dispatching poison pills to worker queues...")
+    def _prepare_manifest(self, json_job_req) -> JobManifest:
+        """
+        Prepare job manifest
+        Return manifest on success or raise exception
+        """
+        # 1. Parse render config and build the manifest
+        job_manifest = self.resolver.create_job_manifest(json_job_req)
 
-            # Reader Pills
-            for _ in eng.reader_procs:
-                self.send_to_worker("read_q", Envelope(op=Op.SHUTDOWN, payload=None))
+        # 2. Verify Engine has the required drivers for this job - raises Exception
+        self._verify_required_drivers(job_manifest)
 
-            # Renderer Pills
-            for _ in eng.renderer_procs:
-                self.send_to_worker("work_q", Envelope(op=Op.SHUTDOWN, payload=None))
+        # 3. Verify render config - raises Exception
+        self._verify_render_config(job_manifest)
 
-            # Writer Pill (Only 1 writer)
-            if eng.writer_proc:
-                self.send_to_worker("writer_q", Envelope(op=Op.SHUTDOWN, payload=None))
+        return job_manifest
 
-            # 3. Graceful Join with Forceful Fallback
-            # We give the processes a moment to see the pill and close their own handles.
-            all_procs = eng.reader_procs + eng.renderer_procs + [eng.writer_proc]
-
-            print("   - Waiting for processes to exit...")
-            for proc in all_procs:
-                if proc is None:
-                    continue
-
-                if proc.is_alive():
-                    # Wait 1.0s for the process to exit cleanly via its loop logic
-                    proc.join(timeout=1.0)
-
-                    # If still alive after timeout, it's deadlocked; force a hard kill
-                    if proc.is_alive():
-                        print(f"   ⚠️ Process {proc.name} unresponsive. Force terminating...")
-                        proc.terminate()
-                        proc.join(timeout=0.2) # Final join to clean up resources
-
-            # 4. Physical Resource Reclamation
-            # Unlink all SHM segments and close queues via the ExitStack logic
-            print("   - Unlinking Shared Memory and closing IPC...")
-            eng.cleanup()
-
-            print("✅ [Orchestrator] System Purge Complete. Daemon Halted.")
-            self.running = False
-
-    def showtime(self, msg):
-        wall_start = datetime.now()
-        start_ts = wall_start.strftime("%H:%M:%S.%f")[:-3]
-        if self.previous_ts == 0:
-            print(f"{start_ts} {msg}")
-        else:
-            print(f"{start_ts} {msg}. Elapsed: {wall_start - self.previous_ts}")
-        self.previous_ts = wall_start
-
-    def _start_next_job(self) -> bool:
-        """Start the next queued job by resolving manifests and preparing worker contexts."""
-        if not self.pending_jobs:
-            return False
-
-        json_job_req = self.pending_jobs.pop(0)
-        job_id = json_job_req.get("job_id", "unknown")
+    def _launch_job(self, job_manifest: JobManifest) -> bool:
+        """
+        Launch the  job in the  manifests after preparing worker contexts.
+        """
+        job_id = job_manifest.job_id
+        self.showtime("Launch Job")
 
         try:
-            # 1. RESOLVE: Parse Render config and build the manifest
-            job_manifest = self.resolver.create_job_manifest(json_job_req)
-            job_id = job_manifest.job_id
-
-            # 1. THE PHYSICAL CONTRACT CHECK
-            # What the Biome logic requires:
-            required_drivers = set(job_manifest.resources.drivers.keys())
-
-            # What the Engine allocated at boot:
-            allocated_pools = set(self.eng_resources.pool_map.keys())
-
-            if not required_drivers.issubset(allocated_pools):
-                missing = required_drivers - allocated_pools
-
-                # ERROR: There is a configuration mismatch between the Render config and the Engine
-                missing_sorted = ", ".join(sorted(missing))
-
-                error_msg = (
-                    f"⚠️ Job: {job_id} - Missing driver configuration\n"
-                    f"This render requires driver(s) that are not available in the current "
-                    f"engine configuration.\n"
-                    f"Missing: {missing_sorted}\n"
-                    f"To fix this, add the missing driver(s) to 'engine_config.yml' under "
-                    f"'driver_specs', then restart Thematic Render."
-                )
-
-                # Report to Client and Abort
-                self._send_to_client({
-                    "msg": "error", "job_id": job_id, "severity": 1,
-                    "message": error_msg
-                })
-                print(f"⚠️ J{error_msg}")
-
-                self.job_control.clear_job()
-                self._start_next_job() # Skip to next pending
-                return False
-
-            # 3. LOGICAL PIPELINE AUDIT (The "Airlock" Check)
-            # Create a lightweight context for the analyzer
-            audit_ctx = SimpleNamespace(
-                render_cfg=job_manifest.render_cfg,
-                eng_resources=self.eng_resources,
-                theme_registry=self.render_stack.theme_reg,
-                anchor_key=job_manifest.resources.anchor_key
-            )
-
-            has_errors, report_md, raw_errors = analyze_pipeline(audit_ctx)
-
-            if has_errors:
-
-                # Build concise summary for the UI
-                error_summary = "\n".join([f"• {err}" for err in raw_errors[:2]])
-                if len(raw_errors) > 2:
-                    error_summary += f"\n...and {len(raw_errors) - 2} more errors."
-
-                final_msg = f"⚠️ Render config errors:\n{error_summary}"
-                print(f"⚠️ [Orchestrator] Job  '{job_id}' {final_msg}")
-
-                self._send_to_client({
-                    "msg": "error",
-                    "job_id": job_id,
-                    "severity": 1, # SEV_CANCEL
-                    "message": final_msg,
-                    "report": report_md # Client can display full Markdown if supported
-                })
-                return self._skip_to_next_job()
-
+            # Reset cache if job is for a different region
             self.eng_resources.sync_to_geography(job_manifest.region_id)
 
-            # 3. INIT RENDER ENGINES
-            # Boot the render engines if they are cold or if drivers changed
-            if  self.render_stack.factor_eng is None:
-                self.render_stack.init_render_engines(
-                    job_manifest.render_cfg, job_manifest.resources, self.eng_resources
-                )
+            # 4. Init render engines
 
-            # 4. INITIALIZE OUTPUT FILE
+            if self.render_stack.factor_eng is None:
+                self.render_stack.init_render_engines(
+                    job_manifest.render_cfg, job_manifest.resources, self.eng_resources, )
+                self.showtime("Render Stack done")
+
+            # 5. Initialize output file
             self._unlink_file_if_exists(job_manifest.temp_out_path)
             self.io_system.initialize_physical_output(
-                job_manifest.temp_out_path, job_manifest.profile
-            )
+                job_manifest.temp_out_path, job_manifest.profile, )
 
-            # 5. RESET TELEMETRY
-            if hasattr(self.eng_resources, 'registry'):
+            # 6. Reset telemetry
+            if hasattr(self.eng_resources, "registry"):
                 self.eng_resources.registry.start_session()
 
-            # 6. PREPARE WORKER CONTEXTS
-            # This handles engine syncing, cache purging, and context assembly
+            # 7. Prepare worker contexts
             reader_ctx, worker_ctx, writer_ctx = self.render_stack.prepare_job_contexts(
                 job_manifest
             )
+            self.showtime("Worker Context done")
 
-            # 7. INITIALIZE JOB CONTROL
+            # 8. Initialize job control
             win_list = self._generate_job_windows(job_manifest)
-            self.job_control = JobControl(manifest=job_manifest, total_tiles=len(win_list))
+            self.job_control = JobControl(
+                manifest=job_manifest, total_tiles=len(win_list), )
 
-            # 8. PUBLISH CONTEXT TO WORKERS
+            # 9. Publish context to workers
             self.eng_resources.update_context(
                 job_id=job_id, reader_data=reader_ctx, worker_data=worker_ctx,
-                writer_data=writer_ctx
-            )
+                writer_data=writer_ctx, )
+            self.showtime("Context published")
 
-            # 9. DISPATCH: Prime the pipeline
+            # 10. Initialize Dispatcher
             self.dispatcher.initialize_job(job_manifest, win_list)
-            dispatch_results = self.dispatcher.prime_pipeline(job_id)
 
-            for result in dispatch_results:
+            # Prime the pipeline
+            candidates = self.dispatcher.get_priming_list(job_id)
+
+            for result in candidates:
                 for read_env in result.read_packets:
-                    self.send_to_worker("read_q", read_env)
+                    self.send_to_worker("reader_q", read_env)
 
                 if result.render_packet:
                     self.send_to_worker(
-                        "work_q", Envelope(op=Op.RENDER_TILE, payload=result.render_packet)
-                    )
-
+                        "worker_q", Envelope(op=Op.RENDER_TILE, payload=result.render_packet), )
+            self.showtime("Pipeline primed")
+            # Return to main processing loop and finish rest of work
             return True
 
-        except Exception as e:
-            #traceback.print_exc()
-            print(f"⚠️ [ORCHESTRATOR] Job '{job_id}' Failed to start: {e}")
+        except Exception:
+            raise
 
-            self._send_to_client(
-                {
-                    "msg": "error", "job_id": job_id, "severity": 1,  # SEV_CANCEL
-                    "message": f"⚠️ Job Initialization error: {str(e)}"
-                }
-            )
+    def _handle_job_cancel(self, envelope: Envelope) -> None:
+        print(f"⚠️ [Orchestrator] Job Cancel : {envelope.op}")
+        # 1. Global SHM Flip (Interruption)
+        self.eng_resources.cancel_active_job()
 
-            self.job_control.clear_job()
-            self._start_next_job()  # Attempt next job in queue
-            return False
+        # 2. Pipeline Signaling (Cleanup)
+        self.send_to_worker('writer_q', Envelope(op=Op.JOB_CANCEL))
 
-    def _skip_to_next_job(self) -> bool:
-        """Helper to clear state and attempt the next job in queue."""
+        # 3. Logic cleanup
         self.job_control.clear_job()
-        return self._start_next_job()
+        self._start_next_job()
+
+    def _handle_error(self, envelope: Envelope) -> None:
+        """
+        Handle a pipeline error, cancel output, or shutdown based on severity.
+        Severity: 0=Fatal (Shutdown), 1=Cancel Job, 2=Warning (Continue)
+        """
+        payload: ErrorPacket = envelope.payload
+        job_id = payload.job_id or self.job_control.job_id
+        sev = payload.severity
+        print(f"Err sev={sev}")
+
+        # 1. Log to Orchestrator Console
+        sev_label = {0: "FATAL", 1: "CANCEL", 2: "WARNING"}.get(sev)
+        print(
+            f"Pipeline received: Sev: {sev_label} From: {payload.section}   "
+            f"Job: '{job_id}' Error: {payload.message}"
+        )
+
+        # 2. Forward to Client Proxy
+        # We send the raw severity so the client can decide how to color the UI
+        self._send_to_client(
+            {
+                "msg": "error", "job_id": job_id, "severity": sev,
+                "message": f"{payload.section} {sev_label.lower()}: {payload.message}",
+            }
+        )
+
+        # 3. Action Logic
+        if sev == SEV_WARNING:
+            # Severity 2: Do nothing else; let the pipeline continue
+            return
+
+        if sev == SEV_CANCEL:
+            # Severity 1: Stop the current job if it matches the active ID
+            if self.job_control.job_id == job_id:
+                # Notify Writer to unlink and close
+                packet = JobDonePacket(job_id=self.job_control.job_id)
+                self.send_to_worker('writer_q', Envelope(op=Op.JOB_CANCEL, payload=packet))
+
+                # Reclaim Shared Memory Slots
+                self.dispatcher.abort_job()
+                self.eng_resources.cancel_active_job()
+
+                # Local cleanup and state reset
+                self.job_control.clear_job()
+                self._start_next_job()
+
+        elif sev == SEV_FATAL:
+            # Severity 0: The system is in an unrecoverable state
+            print(" FATAL ERROR: Initiating emergency system shutdown.")
+            self._initiate_shutdown(" FATAL ERROR: Initiating emergency system shutdown.")
 
     def _handle_tiles_finalized(self, envelope: Envelope) -> None:
         """Publish the finalized temp file and notify the client."""
@@ -372,7 +315,7 @@ class PipelineOrchestrator:
             self.job_control.temp_out_path.replace(
                 self.job_control.final_out_path
             )  # print(f"✅ [Orchestrator] Render complete for job: '{self.job_control.job_id}'")
-        except MemoryError as exc:
+        except Exception as exc:
             print(
                 f"❌ [Orchestrator] Failed to publish temp output "
                 f"'{self.job_control.temp_out_path}' -> '{self.job_control.final_out_path}': {exc}"
@@ -408,6 +351,131 @@ class PipelineOrchestrator:
         self._print_cache_analysis()
         self.job_control.clear_job()
         self._start_next_job()
+
+    def _handle_block_loaded(self, envelope: Envelope) -> None:
+        """Advance a tile after one block finishes loading."""
+        packet: BlockLoadedPacket = envelope.payload
+        if not self.valid_job_id(packet.job_id):
+            return
+
+        render_packet = self.dispatcher.on_driver_block_loaded(
+            packet.job_id, packet.tile_id, packet.read_duration, )
+        if render_packet is not None:
+            self.send_to_worker(
+                "worker_q", Envelope(op=Op.RENDER_TILE, payload=render_packet), )
+
+    def _handle_tile_written(self, envelope: Envelope) -> None:
+        """Release tile resources via the dispatcher and advance job progress."""
+        packet: TileWrittenPacket = envelope.payload
+        if not self.valid_job_id(packet.job_id):
+            return
+        if True:
+            dbg(
+                f" >>> [RECV] Q: {"status":8} | OP: {envelope.op.name:15} | TILE: "
+                f"{packet.tile_id:<5} | "
+                f"JOB: {packet.job_id}"
+                f" [STATE] In-Flight: {"":<3} | Pending Jobs: {"":<2} | "
+                f"Progress: ", packet.tile_id
+            )
+
+        if not self.dispatcher.on_tile_written(packet.tile_id):
+            return
+
+        is_complete = self.job_control.mark_tile_written()
+        if is_complete:
+            self._finalize_job()
+            return
+
+        dispatch_result: DispatchResult = self.dispatcher.dispatch_next_tile(
+            self.job_control.job_id
+        )
+        if dispatch_result.tile_id is None:
+            return
+
+        for env in dispatch_result.read_packets:
+            self.send_to_worker("reader_q", env)
+
+        if dispatch_result.render_packet is not None:
+            self.send_to_worker(
+                "worker_q", Envelope(op=Op.RENDER_TILE, payload=dispatch_result.render_packet), )
+
+    def _handle_wr_abort(self, envelope: Envelope) -> None:
+        self._initiate_shutdown()
+
+    def valid_job_id(self, job_id):
+        return job_id == self.job_control.job_id
+
+    def _initiate_shutdown(self, reason: str):
+        """ cleanup to prevent zombie processes and SHM leaks."""
+        eng = self.eng_resources
+        print(f"\n [Orchestrator] Shutdown Initiated: {reason}")
+
+        # 1. Global shutdown Signal
+        # This acts as a circuit breaker for workers currently processing a tile.
+        if eng.ctx_store:
+            try:
+                eng.ctx_store.set_shutdown()
+                print("   - Global State set to SHUTDOWN ")
+            except Exception as e:
+                print(f"   ⚠️ Failed to set  shutdown state: {e}")
+
+        # 2. Sequential Poison Pill Injection
+        # We must send one SHUTDOWN packet per process in each pool.
+        print("   - Dispatching poison pills to worker queues...")
+
+        # Reader Pills
+        for _ in eng.reader_procs:
+            self.send_to_worker("reader_q", Envelope(op=Op.SHUTDOWN, payload=None))
+
+        # Worker Pills
+        for _ in eng.worker_procs:
+            self.send_to_worker("worker_q", Envelope(op=Op.SHUTDOWN, payload=None))
+
+        # Writer Pill (Only 1 writer)
+        if eng.writer_proc:
+            self.send_to_worker("writer_q", Envelope(op=Op.SHUTDOWN, payload=None))
+
+        # 3. Graceful Join with Forceful Fallback
+        # We give the processes a moment to see the pill and close their own handles.
+        all_procs = eng.reader_procs + eng.worker_procs + [eng.writer_proc]
+
+        print("   - Waiting for processes to exit...")
+        for proc in all_procs:
+            if proc is None:
+                continue
+
+            if proc.is_alive():
+                # Wait 1.0s for the process to exit cleanly via its loop logic
+                proc.join(timeout=1.0)
+
+                # If still alive after timeout, it's deadlocked; force a hard kill
+                if proc.is_alive():
+                    print(f"   ⚠️ Process {proc.name} unresponsive. Force terminating...")
+                    proc.terminate()
+                    proc.join(timeout=0.2)  # Final join to clean up resources
+
+        # 4. Physical Resource Reclamation
+        # Unlink all SHM segments and close queues via the ExitStack logic
+        print("   - Unlinking Shared Memory and closing IPC...")
+        eng.cleanup()
+
+        print("✅ [Orchestrator] System Purge Complete. Daemon Halted.")
+        self.running = False
+
+    def showtime(self, msg):
+        wall_start = datetime.now()
+        start_ts = wall_start.strftime("%H:%M:%S.%f")[:-3]
+        if self.previous_ts is None:
+            print(f"{start_ts} {msg}")
+        else:
+            print(f"{start_ts} {msg}. Elapsed: {wall_start - self.previous_ts}")
+        self.previous_ts = wall_start
+
+    def _handle_unknown_op(self, envelope: Envelope) -> None:
+        """Fallback handler for unregistered OpCodes."""
+        self.stats.unknown_ops += 1
+        print(f"⚠️ [Orchestrator] ERROR: Unknown OpCode: {envelope.op}")
+        self._initiate_shutdown(" ")
 
     def _print_cache_analysis(self):
         stats = self.eng_resources.registry.get_telemetry()
@@ -509,187 +577,62 @@ class PipelineOrchestrator:
 
         return tiles
 
-    def _handle_block_loaded(self, envelope: Envelope) -> None:
-        """Advance a tile after one block finishes loading."""
-        packet: BlockLoadedPacket = envelope.payload
-        if not self.valid_job_id(packet.job_id):
-            return
-
-        render_packet = self.dispatcher.on_driver_block_loaded(
-            packet.job_id, packet.tile_id, packet.read_duration, )
-        if render_packet is not None:
-            self.send_to_worker(
-                "work_q", Envelope(op=Op.RENDER_TILE, payload=render_packet), )
-
-    def _handle_tile_written(self, envelope: Envelope) -> None:
-        """Release tile resources via the dispatcher and advance job progress."""
-        packet: TileWrittenPacket = envelope.payload
-        if not self.valid_job_id(packet.job_id):
-            return
-        if True:
-            dbg(
-                f" >>> [RECV] Q: {"status":8} | OP: {envelope.op.name:15} | TILE: "
-                f"{packet.tile_id:<5} | "
-                f"JOB: {packet.job_id}"
-                f" [STATE] In-Flight: {"":<3} | Pending Jobs: {"":<2} | "
-                f"Progress: ", packet.tile_id
-            )
-
-        if not self.dispatcher.on_tile_written(packet.tile_id):
-            return
-
-        is_complete = self.job_control.mark_tile_written()
-        if is_complete:
-            self._finalize_job()
-            return
-
-        dispatch_result: DispatchResult = self.dispatcher.dispatch_next_tile(
-            self.job_control.job_id
-        )
-        if dispatch_result.tile_id is None:
-            return
-
-        for env in dispatch_result.read_packets:
-            self.send_to_worker("read_q", env)
-
-        if dispatch_result.render_packet is not None:
-            self.send_to_worker(
-                "work_q", Envelope(op=Op.RENDER_TILE, payload=dispatch_result.render_packet), )
-
-    def _handle_unknown_op(self, envelope: Envelope) -> None:
-        """Fallback handler for unregistered OpCodes."""
-        self.stats.unknown_ops += 1
-        print(f"⚠️ [Orchestrator] ERROR: Unknown OpCode: {envelope.op}")
-        self._initiate_shutdown(" ")
-
-    def _handle_job_cancel(self, envelope: Envelope) -> None:
-        print(f"⚠️ [Orchestrator] Job Cancel : {envelope.op}")
-        # 1. Global SHM Flip (Interruption)
-        self.eng_resources.cancel_active_job()
-
-        # 2. Pipeline Signaling (Cleanup)
-        self.send_to_worker('writer_q', Envelope(op=Op.JOB_CANCEL))
-
-        # 3. Logic cleanup
-        self.job_control.clear_job()
-
-    def _handle_wr_abort(self, envelope: Envelope) -> None:
-        self._initiate_shutdown()
-
-    def valid_job_id(self, job_id):
-        valid = job_id == self.job_control.job_id
-        if not valid:
-            self.stats.bad_job_ids += 1
-        return valid
-
-    def _handle_error(self, envelope: Envelope) -> None:
-        """
-        Handle a pipeline error, cancel output, or shutdown based on severity.
-        Severity: 0=Fatal (Shutdown), 1=Cancel Job, 2=Warning (Continue)
-        """
-        # TODO Implement Remainder of error handling spec
-        payload: ErrorPacket = envelope.payload
-        job_id = payload.job_id or self.job_control.job_id
-        sev = payload.severity
-        print(f"Err sev={sev}")
-
-        # 1. Log to Orchestrator Console
-        sev_label = {0: "FATAL", 1: "CANCEL", 2: "WARNING"}.get(sev)
-        print(
-            f"Pipeline received: Sev: {sev_label} From: {payload.section}   "
-            f"Job: '{job_id}' Error: {payload.message}"
-        )
-
-        # 2. Forward to Client Proxy
-        # We send the raw severity so the client can decide how to color the UI
-        self._send_to_client(
-            {
-                "msg": "error", "job_id": job_id, "severity": sev,
-                "message": f"{payload.section} {sev_label.lower()}: {payload.message}",
-            }
-        )
-
-        # 3. Action Logic
-        if sev == SEV_WARNING:
-            # Severity 2: Do nothing else; let the pipeline continue
-            return
-
-        if sev == SEV_CANCEL:
-            # Severity 1: Stop the current job if it matches the active ID
-            if self.job_control.job_id == job_id:
-                # Notify Writer to unlink and close
-                packet = JobDonePacket(job_id=self.job_control.job_id)
-                self.send_to_worker('writer_q', Envelope(op=Op.JOB_CANCEL, payload=packet))
-
-                # Reclaim Shared Memory Slots
-                self.dispatcher.abort_job()
-
-                self.eng_resources.cancel_active_job()
-
-                # Local cleanup and state reset
-                self.job_control.clear_job()
-
-        elif sev == SEV_FATAL:
-            # Severity 0: The system is in an unrecoverable state
-            print(" FATAL ERROR: Initiating emergency system shutdown.")
-            self._initiate_shutdown(" FATAL ERROR: Initiating emergency system shutdown.")
-
     def send_to_worker(self, queue_attr: str, envelope: Envelope) -> None:
-            """
-            Hardened IPC dispatch for worker queues with fault detection.
-            """
-            # 1. DEFENSIVE QUEUE LOOKUP
-            # getattr is safe, but we must ensure the attribute exists and isn't None
-            queue = getattr(self.eng_resources, queue_attr, None)
-            if queue is None:
-                print(f"⚠️ [SEND_ERROR] Target queue '{queue_attr}' is not initialized.")
-                return
+        """
+        Hardened IPC dispatch for worker queues with fault detection.
+        """
+        # 1. DEFENSIVE QUEUE LOOKUP
+        # getattr is safe, but we must ensure the attribute exists and isn't None
+        queue = getattr(self.eng_resources, queue_attr, None)
+        if queue is None:
+            print(f"⚠️ [SEND_ERROR] Target queue '{queue_attr}' is not initialized.")
+            return
 
-            # 2. THE HARDENED 'PUT'
-            try:
-                # We use a non-blocking put or a very short timeout to detect
-                # deadlocked queues, but for this architecture, a standard put
-                # wrapped in exception handling is usually the 'Fact-Based' choice.
-                queue.put(envelope)
-            except (OSError, ValueError, BrokenPipeError) as e:
-                # This happens if the queue was closed by another process
-                # or the system is halfway through a shutdown.
-                print(f"❌ [IPC FAILURE] Cannot send to {queue_attr}: {e}")
-                # If the system is supposed to be running, this is a fatal logic error
-                if self.running:
-                    self._initiate_shutdown(f"IPC Channel {queue_attr} collapsed.")
-                return
+        # 2. THE HARDENED 'PUT'
+        try:
+            # We use a non-blocking put or a very short timeout to detect
+            # deadlocked queues, but for this architecture, a standard put
+            # wrapped in exception handling is usually the 'Fact-Based' choice.
+            queue.put(envelope)
+        except (OSError, ValueError, BrokenPipeError) as e:
+            # This happens if the queue was closed by another process
+            # or the system is halfway through a shutdown.
+            print(f"❌ [IPC FAILURE] Cannot send to {queue_attr}: {e}")
+            # If the system is supposed to be running, this is a fatal logic error
+            if self.running:
+                self._initiate_shutdown(f"IPC Channel {queue_attr} collapsed.")
+            return
 
-            # 3. DEFENSIVE METADATA EXTRACTION
-            # We must assume self.job_control or envelope.payload could be None
-            # during edge-case state transitions (like a shutdown).
-            payload = envelope.payload
-            tile_id = getattr(payload, 'tile_id', '-')
+        # 3. DEFENSIVE METADATA EXTRACTION
+        # We must assume self.job_control or envelope.payload could be None
+        # during edge-case state transitions (like a shutdown).
+        payload = envelope.payload
+        tile_id = getattr(payload, 'tile_id', '-')
 
-            # Safe Job ID fallback
-            job_id = "N/A"
-            if payload and hasattr(payload, 'job_id'):
-                job_id = payload.job_id
-            elif self.job_control:
-                job_id = self.job_control.job_id
+        # Safe Job ID fallback
+        job_id = "N/A"
+        if payload and hasattr(payload, 'job_id'):
+            job_id = payload.job_id
+        elif self.job_control:
+            job_id = self.job_control.job_id
 
-            # 4. SAFE STATE CAPTURE
-            pending_jobs = len(self.pending_jobs)
-            in_flight = len(self.dispatcher.active_tiles) if self.dispatcher else 0
+        # 4. SAFE STATE CAPTURE
+        pending_jobs = len(self.pending_jobs)
+        in_flight = len(self.dispatcher.active_tiles) if self.dispatcher else 0
 
-            # Calculate progress only if job_control is active
-            if self.job_control:
-                prog_str = f"{self.job_control.tiles_written}/{self.job_control.total_tiles}"
-            else:
-                prog_str = "IDLE"
+        # Calculate progress only if job_control is active
+        if self.job_control:
+            prog_str = f"{self.job_control.tiles_written}/{self.job_control.total_tiles}"
+        else:
+            prog_str = "IDLE"
 
-            # 5. VISIBILITY (Using the existing dbg helper)
-            dbg(
-                f" >>> [SEND] Q: {queue_attr:8} | OP: {envelope.op.name:15} | TILE: {tile_id:<5} | "
-                f"JOB: {job_id:10} | "
-                f"[STATE] In-Flight: {in_flight:<3} | Pending: {pending_jobs:<2} | "
-                f"Progress: {prog_str}", tile_id
-            )
+        # 5. VISIBILITY (Using the existing dbg helper)
+        dbg(
+            f" >>> [SEND] Q: {queue_attr:8} | OP: {envelope.op.name:15} | TILE: {tile_id:<5} | "
+            f"JOB: {job_id:10} | "
+            f"[STATE] In-Flight: {in_flight:<3} | Pending: {pending_jobs:<2} | "
+            f"Progress: {prog_str}", tile_id
+        )
 
     @staticmethod
     def _build_temp_output_path(final_path: Path, job_id: str) -> Path:
@@ -744,6 +687,61 @@ class PipelineOrchestrator:
             }
         )
         self.last_progress_pulse = now
+
+    def _verify_required_drivers(self, job_manifest) -> None:
+        """Verify that all drivers required by the render are available.
+
+        Args:
+            job_manifest: Resolved manifest for the pending job.
+
+        Raises:
+            Exception if not all required drivers are available
+        """
+        job_id = job_manifest.job_id
+
+        required_drivers = set(job_manifest.resources.drivers.keys())
+        allocated_pools = set(self.eng_resources.pool_map.keys())
+
+        if required_drivers.issubset(allocated_pools):
+            return
+
+        missing = required_drivers - allocated_pools
+        missing_sorted = ", ".join(sorted(missing))
+
+        error_msg = (f"⚠️ Job: {job_id} - Missing driver configuration\n"
+                     f"This render requires driver(s) that are not available in the current "
+                     f"engine configuration.\n"
+                     f"Missing: {missing_sorted}\n"
+                     f"To fix this, add the missing driver(s) to 'engine_config.yml' under "
+                     f"'driver_specs', then restart Thematic Render.")
+        raise ValueError(f"⚠️ {error_msg}")
+
+    def _verify_render_config(self, job_manifest) -> None:
+        """Verify that the render pipeline is internally valid.
+
+        Args:
+            job_manifest: Resolved manifest for the pending job.
+
+        Raises:
+            Exception if the pipeline audit fails.
+        """
+        audit_ctx = SimpleNamespace(
+            render_cfg=job_manifest.render_cfg, eng_resources=self.eng_resources,
+            theme_registry=self.render_stack.theme_reg,
+            anchor_key=job_manifest.resources.anchor_key, )
+
+        has_errors, report_md, raw_errors = analyze_pipeline(audit_ctx)
+        if not has_errors:
+            return True
+
+        job_id = job_manifest.job_id
+        error_summary = "\n".join(f"• {err}" for err in raw_errors[:2])
+
+        if len(raw_errors) > 2:
+            error_summary += f"\n...and {len(raw_errors) - 2} more errors."
+
+        final_msg = f"⚠️ Render config errors:\n{error_summary}"
+        raise ValueError(final_msg)
 
 
 class JobResolver:
@@ -828,8 +826,7 @@ class JobResolver:
 
         # 5. Add hashes
         resources = resources.with_hashes(
-            geography_hash=geography_hash,
-            hashes=hashes
+            geography_hash=geography_hash, hashes=hashes
         )
 
         return JobManifest(

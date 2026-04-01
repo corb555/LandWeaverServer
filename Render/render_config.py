@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import operator
 from pathlib import Path
 from typing import (Any, Tuple, Iterable, Set, Dict, List)
 
@@ -12,9 +11,9 @@ import numpy as np
 from YMLEditor.yaml_reader import ConfigLoader
 
 from Common.keys import DriverKey, FileKey, NoiseSpec, RequiredResources, _BlendSpec, SurfaceSpec, \
-    FactorSpec, PipelineRequirements, SurfaceModifierSpec, SurfaceKey, DriverRndrSpec
+    FactorSpec, PipelineRequirements, SurfaceModifierSpec, SurfaceKey, DriverRndrSpec, DTYPE_ALIASES
 from Render.schema import RENDER_SCHEMA
-from Render.utils import DTYPE_ALIASES, GenMarkdown
+from Render.utils import  GenMarkdown
 
 
 # render_config.py
@@ -120,8 +119,7 @@ class RenderConfig:
                         coord_factor=data.get("coord_factor"),
                         required_factors=tuple(data.get("required_factors", [])),
                         provider_id=data.get("provider_id", "ramp"),
-                        modifiers=data.get("modifiers", []),
-                        files=tuple(data.get("files", [])),
+                        modifiers=data.get("modifiers", []), files=tuple(data.get("files", [])),
                         desc=data.get("desc", "")
                     )
                 )
@@ -260,44 +258,45 @@ class RenderConfig:
         return self.raw_defs.get(key, default)
 
     def get_hashes(self) -> Dict[str, str]:
-            """
-            Declarative hash generation.
-            Precedence: Top-level YAML sections override file-freshness checks.
-            """
-            hash_schema = {
-                "topology": ["pipeline", "logic", "driver_specs"],
-                "logic":    ["factors", "factor_specs", "noise_profiles"],
-                "style":    ["surfaces", "theme_render", "surface_modifier_specs", "theme_qml"]
-            }
+        """
+        Declarative hash generation.
+        Precedence: Top-level YAML sections override file-freshness checks.
+        """
+        hash_schema = {
+            "topology": ["pipeline", "logic", "driver_specs"],
+            "logic": ["factors", "factor_specs", "noise_profiles"],
+            "style": ["surfaces", "theme_render", "surface_modifier_specs", "theme_qml"]
+        }
 
-            hashes = {}
+        hashes = {}
 
-            for bucket, keys in hash_schema.items():
-                bucket_data = {}
+        for bucket, keys in hash_schema.items():
+            bucket_data = {}
 
-                for k in keys:
-                    # 1. PRECEDENCE: If the key is a top-level YAML section,
-                    # use the data directly and move to the next key.
-                    if k in self.raw_defs:
-                        bucket_data[k] = self.raw_defs[k]
-                        continue
+            for k in keys:
+                # 1. PRECEDENCE: If the key is a top-level YAML section,
+                # use the data directly and move to the next key.
+                if k in self.raw_defs:
+                    bucket_data[k] = self.raw_defs[k]
+                    continue
 
-                    # TODO Remove hard-code of theme_qml and explicitly get from YAML config
-                    # 2. FALLBACK: If not in YAML, check if the key refers
-                    # to a physical file. If so, capture its modification time.
-                    if k == "theme_qml":
-                        file_path = self.path(k)
-                        bucket_data[f"{k}_mtime"] = file_path.stat().st_mtime
+                # TODO Remove hard-code of theme_qml and explicitly get from YAML config
+                # 2. FALLBACK: If not in YAML, check if the key refers
+                # to a physical file. If so, capture its modification time.
+                if k == "theme_qml":
+                    file_path = self.path(k)
+                    bucket_data[f"{k}_mtime"] = file_path.stat().st_mtime
 
-                # Generate the final deterministic hash for this bucket
-                hashes[bucket] = self._generate_hash(bucket_data)
+            # Generate the final deterministic hash for this bucket
+            hashes[bucket] = self._generate_hash(bucket_data)
 
-            return hashes
+        return hashes
 
     @staticmethod
     def _generate_hash(data: dict) -> str:
         encoded = json.dumps(data, sort_keys=True).encode("utf-8")
         return hashlib.md5(encoded).hexdigest()
+
 
 Slice2D = Tuple[slice, slice]
 
@@ -435,6 +434,7 @@ def derive_resources(*, render_cfg: RenderConfig) -> RequiredResources:
         noise_profiles=noise_profiles, factor_inputs=preq.factor_names,
         surface_inputs=preq.surface_inputs, primary_surface=None, )
 
+
 def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
     """
     Performs a strict logical audit of the compositing sequence.
@@ -466,7 +466,7 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
     # 2. SIMULATED STATE: Tracks what exists at each step
     sim_surfaces = set(library_surface_names)
     sim_factors = set(library_factor_names)
-    sim_buffers = set() # Buffers that have been created. canvas is default buffer
+    sim_buffers = set()  # Buffers that have been created. canvas is default buffer
     sim_buffers.add("canvas")
 
     # 3. PIPELINE LOOP (The Narrative Audit)
@@ -478,7 +478,9 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
             for skey in step.input_surfaces:
                 sname = get_exact_val(skey)
                 if sname not in sim_surfaces and sname not in sim_buffers:
-                    add_warning(i, f"⚠️ **Render Config error:** Surface/Buffer '{sname}' not found.")
+                    add_warning(
+                        i, f"⚠️ **Render Config error:** Surface/Buffer '{sname}' not found."
+                        )
 
         # CHECK 2: Factor Dependency
         if step.factor_nm:
@@ -490,8 +492,10 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
         # Operators like 'lerp_buffers' or 'multiply' usually require an existing buffer
         if step.comp_op not in ["create_buffer"] and step.buffer:
             if step.buffer not in sim_buffers:
-                add_warning(i, f"⚠️ **Render Config error:** Buffer '{step.buffer}' used before "
-                               f"'create_buffer'. Available = '{sim_buffers}'")
+                add_warning(
+                    i, f"⚠️ **Render Config error:** Buffer '{step.buffer}' used before "
+                       f"'create_buffer'. Available = '{sim_buffers}'"
+                    )
 
         # --- UPDATE SIMULATED STATE ---
         if step.comp_op == "create_buffer":

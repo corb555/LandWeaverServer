@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Tuple
 
 from Pipeline.job_control import JobManifest
@@ -37,6 +38,7 @@ class RenderStack:
         self.factor_eng = FactorEngine(
             render_cfg, self.theme_reg, self.noise_lib, render_cfg.factors, resources, None
         )
+        print("FactorEngine initialized")
 
     def prepare_job_contexts(
             self, manifest: 'JobManifest'
@@ -72,3 +74,4 @@ class RenderStack:
         )
 
         return reader_ctx, worker_ctx, writer_ctx
+

@@ -51,22 +51,17 @@ class FactorEngine:
     def generate_factors(
             self, data_2d: dict, masks_2d: dict, window: Window, anchor_key: Any
     ) -> dict:
-        """
-        Generates  factors (alpha masks) from raw data.
 
-        The pipeline definition controls which factors to call from the factor library.
-        The engine acts as the orchestrator, preparing the shared context and
-        executing the specified factor library functions in order.
-        """
         factors = {}
 
-        # Use the anchor driver to establish the master spatial resolution for this tile
+        # 1. ESTABLISH GEOMETRY
         target_h, target_w = data_2d[anchor_key].shape[:2]
 
-        # Retrieve the set of factors required by the current pipeline definition
+        # 2. RESOLVE REQUIREMENTS
         required_factors = self.render_resources.factor_inputs
 
-        # Create a different context object with different parameter names
+        # 3. PREPARE SHARED CONTEXT
+        # pass the full cfg for global access
         lib_ctx = SimpleNamespace(
             cfg=self.cfg, themes=self.themes, noises=self.noise_registry, window=window,
             data_2d=data_2d, masks_2d=masks_2d, factors=factors, target_shape=(target_h, target_w),
@@ -77,43 +72,34 @@ class FactorEngine:
             if spec.name not in required_factors:
                 continue
 
-            # print(f"GENERATE factor {spec.name}")
-
-            # --- Ensure drivers setting exists for this factor ---
-            if spec.name not in self.cfg.logic:
-                raise KeyError(
-                    f"\n❌ Config error: Factor '{spec.name}' has no drivers entry in config."
-                )
-
             lib_ctx.spec = spec
 
             try:
-                # This is a global override for debugging - replaces factor with all ones
                 override_target = self.cfg.get_global("override_factor")
                 if override_target == spec.name:
+                    # Override factor for debugging
                     res = np.ones((target_h, target_w, 1), dtype="float32")
                 else:
-                    # INVOKE LIBRARY:  call the external function defined in factor_library
+                    # INVOKE LIBRARY
                     res = fn(data_2d, masks_2d, spec.name, lib_ctx)
 
                 if res is None:
                     raise ValueError(f"Factor library function {spec.name} returned None")
 
-                # THE STORAGE CONTRACT: Convert 2D compute results into 3D (H, W, 1) semantic masks
+                # STORAGE CONTRACT: Ensure 3D (H, W, 1)
                 if res.ndim == 2:
                     res = res[..., np.newaxis]
 
-                # VALIDATION: Ensure the library output aligns with the master tile geometry
+                # VALIDATION: Ensure alignment with master tile geometry
                 if res.shape != (target_h, target_w, 1):
                     raise ValueError(
                         f"Shape mismatch: Expected ({target_h}, {target_w}, 1), got {res.shape}"
                     )
 
-                # Store the standardized factor for use in the compositor or by downstream factors
                 factors[spec.name] = res.astype("float32")
 
-            except MemoryError as e:
-                raise ValueError(f"\n Factor Engine: [{spec.name}] {e}")
+            except Exception as e:
+                raise RuntimeError(f"Factor Engine Error: [{spec.name}] {e}")
 
         return factors
 

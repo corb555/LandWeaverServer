@@ -420,17 +420,17 @@ This design provides several advantages:
 
 ```json
 {
-            "msg": "render_request",
-            "request_id": 12,
-            "params": {
-              "percent": 0.2,
-              "row": 0.1,
-              "col": 0.9,
-              "config_path": "config/biome.yml",
-              "build_dir": "build/Sedona",
-              "output_file": "Sedona_biome.tif"
-            }
-        }
+  "msg": "render_request",
+  "request_id": 12,
+  "params": {
+    "percent": 0.2,
+    "row": 0.1,
+    "col": 0.9,
+    "config_path": "config/biome.yml",
+    "build_dir": "build/Sedona",
+    "output_file": "Sedona_biome.tif"
+  }
+}
 ```
 
 ## Daemon to Editor Socket Messages
@@ -450,25 +450,25 @@ This design provides several advantages:
 
 ```json
 {
-            "msg": "error",
-            "request_id": 12,
-            "message": "Render failed"
-        }
+  "msg": "error",
+  "request_id": 12,
+  "message": "Render failed"
+}
 ```
 
 ```json
 {
-            "msg": "telemetry",
-            "request_id": 12,
-            "details": "# details to come"
-        }
+  "msg": "telemetry",
+  "request_id": 12,
+  "details": "# details to come"
+}
 ```
 
 ```json
 {
-            "msg": "progress",
-            "request_id": 12,
-            "progress": 85,
-            "message": ""
-        }
+  "msg": "progress",
+  "request_id": 12,
+  "progress": 85,
+  "message": ""
+}
 ```

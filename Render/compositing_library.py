@@ -137,8 +137,8 @@ class CompositingLibrary:
         buffers[spec.buffer] = np.clip(current + reflection, 0, 255)
 
     @staticmethod
-    @register_op("write_output", required_attrs=["buffer"])
-    def write_output(buffers, surfaces, factors, factor, spec, ctx):
+    @register_op("output_buffer", required_attrs=["buffer"])
+    def output_buffer(buffers, surfaces, factors, factor, spec, ctx):
         src_name = spec.buffer
         if src_name not in buffers:
             raise KeyError(f"Write Output failed: Buffer '{src_name}' not found.")

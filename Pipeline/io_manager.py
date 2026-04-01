@@ -148,7 +148,9 @@ class IOManager:
                 self.sources[dkey] = self._stack.enter_context(rasterio.open(path))
             except Exception as e:
                 if path is None:
-                    raise IOError(f"Error '{dkey} is not defined in files config section.     {str(e)}")
+                    raise IOError(
+                        f"Error '{dkey} is not defined in files config section.     {str(e)}"
+                        )
                 else:
                     raise IOError(f"Error for '{dkey}' path:'{path}'.     {str(e)}")
         return self

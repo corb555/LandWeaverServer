@@ -1,39 +1,7 @@
 from time import perf_counter
-from typing import Optional
-
-import numpy as np
-from rasterio.windows import Window
-
-from Common.ipc_packets import WindowRect
-
-ERR_PREFIX = "❌ Error: Blend Pipeline - "
-
-# Output tiling defaults
-DEFAULT_BLOCK_SIZE = 256
-ALPHA_DENOM = 255.0
-
-
-def _onoff(v: bool) -> str:
-    """Render a boolean as a compact CLI indicator.
-
-    Args:
-        v: Value to render.
-
-    Returns:
-        `"✅"` if True.
-    """
-    return "✅" if v else " - "
-
-
-DTYPE_ALIASES = {
-    "uint8": np.uint8, "ubyte": np.uint8, "byte": np.uint8, "int16": np.int16, "uint16": np.uint16,
-    "int32": np.int32, "uint32": np.uint32, "float32": np.float32, "float": np.float32,
-    "float64": np.float64, "double": np.float64,
-}
-
-
 from typing import Any
-
+import ast
+import numpy as np
 
 def dot_get(obj: Any, path: str, default: Any = None) -> Any:
     """
@@ -65,11 +33,6 @@ def dot_get(obj: Any, path: str, default: Any = None) -> Any:
             return default
 
     return current
-
-def window_from_rect(r: WindowRect) -> Window:
-    col, row, w, h = r
-    return Window(col, row, w, h)
-
 
 class TimerStats:
     def __init__(self):
@@ -151,3 +114,93 @@ def stats_once(tag, a):
 def reset_print_once():
     """Call this at the start of process_rasters if you want a fresh log per run."""
     _SEEN_MSGS.clear()
+
+
+EPSILON = 1e-6
+
+def lerp(a: np.ndarray, b: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Linearly interpolate between arrays."""
+    return a + t * (b - a)
+
+
+def clamp(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Clamp values to a range."""
+    return np.clip(x, lo, hi)
+
+
+def smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
+    """Hermite smoothstep."""
+    denom = max(e1 - e0, EPSILON)
+    t = np.clip((x - e0) / denom, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+SAFE_FUNCTIONS = {
+    "clip": np.clip,
+    "min": np.minimum,
+    "max": np.maximum,
+    "pow": np.power,
+    "where": np.where,
+    "abs": np.abs,
+    "log": np.log,
+    "sqrt": np.sqrt,
+    "exp": np.exp,
+    "lerp": lerp,
+    "clamp": clamp,
+    "smoothstep": smoothstep,
+}
+
+SAFE_NODE_TYPES = {
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Call,
+    ast.Name,
+    ast.Load,
+    ast.Constant,
+    ast.keyword,
+    ast.Tuple,
+    ast.List,
+    ast.USub,
+    ast.UAdd,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Pow,
+}
+
+
+def compile_expression(expr_str: str) -> Any:
+    """Audit and compile an expression string.
+
+    Args:
+        expr_str: User expression in restricted math syntax.
+
+    Returns:
+        Compiled code object.
+
+    Raises:
+        ValueError: If the expression contains disallowed syntax or names.
+    """
+    if not expr_str:
+        raise ValueError("Expression string is empty.")
+
+    tree = ast.parse(expr_str, mode="eval")
+
+    for node in ast.walk(tree):
+        if type(node) not in SAFE_NODE_TYPES:
+            raise ValueError(
+                f"Illegal expression component: {type(node).__name__}"
+            )
+
+        if isinstance(node, ast.Attribute):
+            raise ValueError("Attribute access is not allowed.")
+
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only direct safe function calls are allowed.")
+            if node.func.id not in SAFE_FUNCTIONS:
+                raise ValueError(f"Illegal function call: {node.func.id}")
+
+    return compile(tree, "<expression>", "eval")

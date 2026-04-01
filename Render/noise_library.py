@@ -1,4 +1,6 @@
+import concurrent.futures
 from dataclasses import dataclass, field
+from datetime import datetime
 from multiprocessing.shared_memory import SharedMemory
 from typing import Dict, Any, Optional, Tuple
 
@@ -58,16 +60,18 @@ class NoiseProvider:
             pass
 
     def cleanup(self, unlink: bool = False):
-        """Close local handle and optionally delete the SHM segment."""
-        if self._shm is not None:
-            self._shm.close()
-            if unlink:
-                try:
-                    self._shm.unlink()
-                except (FileNotFoundError, PermissionError):
-                    pass
-            self._shm = None
-            self._tile = None
+        """Standardized cleanup for the entire library."""
+        if not self.providers:
+            return
+
+        for name, provider in self.providers.items():
+            try:
+                # Call the specific cleanup code you provided
+                provider.cleanup(unlink=unlink)
+            except Exception as e:
+                print(f"   ⚠️  Error cleaning up provider '{name}': {e}")
+
+        self.providers.clear()
 
     @property
     def tile(self) -> np.ndarray:
@@ -104,45 +108,71 @@ class NoiseProvider:
 
 class NoiseLibrary:
     def __init__(self, cfg, profiles: Dict[str, Any], create_shm: bool = False):
+        self.previous_ts: datetime = None
         self.providers: Dict[str, NoiseProvider] = {}
         self.profiles = profiles
-
-        # Use a consistent seed from the global config
+        self.noise_shape = (2048, 2048)
         base_seed = cfg.get_global("seed", 42)
 
-        for noise_id, profile in profiles.items():
-            shm_name = f"tr_noise_{noise_id}"
+        if create_shm:
+            self.showtime("NoiseLibrary: Parallel Initialization Start")
 
-            # Use a standard tile size for all noise (e.g., 2048x2048)
-            noise_shape = (2048, 2048)
+            # 1. Dispatch all heavy generation and SHM tasks to a thread pool
+            # NumPy/FFT release the GIL, so this provides true CPU parallelism.
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = []
+                for noise_id, profile in profiles.items():
+                    futures.append(
+                        executor.submit(
+                            self._generate_and_store_shm,
+                            noise_id, profile, base_seed
+                        )
+                    )
 
-            if create_shm:
-                # 1. Generate the heavy noise data exactly once
-                tile_data = generate_fbm_noise_tile(
-                    shape=noise_shape, sigmas=profile.sigmas, weights=profile.weights,
-                    stretch=profile.stretch, seed=base_seed + profile.seed_offset
-                )
+                # Wait for all threads to complete before proceeding
+                concurrent.futures.wait(futures)
 
-                # 2. Cleanup and Allocate Shared Memory
-                try:
-                    old = SharedMemory(name=shm_name)
-                    old.close()
-                    old.unlink()
-                except FileNotFoundError:
-                    pass
+            self.showtime("NoiseLibrary: Parallel Initialization Complete")
 
-                shm = SharedMemory(create=True, size=tile_data.nbytes, name=shm_name)
-
-                # 3. Copy pixels to SHM
-                shm_view = np.ndarray(tile_data.shape, dtype=tile_data.dtype, buffer=shm.buf)
-                shm_view[:] = tile_data[:]
-                shm.close()
-
-            # --- BOTH MODES: Register the Provider ---
-            # Workers just create the handle to attach to later
+        # 2. BOTH MODES: Register the Providers (Lightweight Metadata only)
+        for noise_id in profiles.keys():
             self.providers[noise_id] = NoiseProvider(
-                shm_name=shm_name, shape=noise_shape, dtype=np.float32
+                shm_name=f"tr_noise_{noise_id}",
+                shape=self.noise_shape,
+                dtype=np.float32
             )
+
+    def _generate_and_store_shm(self, noise_id: str, profile: Any, base_seed: int):
+        """Worker function run in parallel threads for Pipeline boot."""
+        shm_name = f"tr_noise_{noise_id}"
+
+        # A. Heavy Math (FFT-based generation)
+        tile_data = generate_fbm_noise_tile(
+            shape=self.noise_shape,
+            sigmas=profile.sigmas,
+            weights=profile.weights,
+            stretch=profile.stretch,
+            seed=base_seed + profile.seed_offset
+        )
+
+        # B. SHM Resource Management
+        try:
+            old = SharedMemory(name=shm_name)
+            old.close()
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+        shm = SharedMemory(create=True, size=tile_data.nbytes, name=shm_name)
+
+        # C. Zero-Copy Transfer
+        # Wrap the SHM buffer in a numpy view and copy pixels
+        shm_view = np.ndarray(tile_data.shape, dtype=tile_data.dtype, buffer=shm.buf)
+        shm_view[:] = tile_data[:]
+
+        # Close handle (Unlink remains active in OS until daemon shutdown)
+        shm.close()
+        self.showtime(f"NoiseLibrary: {shm_name} created & stored")
 
     def attach_providers_shm(self):
         """Called by Workers during JIT Context Switch."""
@@ -161,8 +191,74 @@ class NoiseLibrary:
         for provider in self.providers.values():
             provider.cleanup(unlink=unlink)
 
+    def showtime(self, msg):
+        wall_start = datetime.now()
+        start_ts = wall_start.strftime("%H:%M:%S.%f")[:-3]
+        if self.previous_ts is None:
+            print(f"{start_ts} {msg}")
+        else:
+            print(f"{start_ts} {msg}. Elapsed: {wall_start - self.previous_ts}")
+        self.previous_ts = wall_start
+
+import numpy as np
 
 def generate_fbm_noise_tile(
+        shape: tuple[int, int], *, sigmas: tuple[float, ...] = (1.5, 4.0, 10.0),
+        weights: tuple[float, ...] = (0.4, 0.3, 0.3), stretch: tuple[float, float] = (1.0, 1.0),
+        seed: int = 42
+) -> np.ndarray:
+    """
+    Generates a multi-scale 2D smooth noise tile using FFT-based Gaussian blurring.
+
+    Performance: Constant time relative to sigma size.
+    Quality: Native periodic wrapping (zero edge artifacts).
+    """
+    rng = np.random.default_rng(seed)
+    h, w = shape
+    out = np.zeros(shape, dtype="float32")
+
+    # Pre-calculate frequency grids (normalized frequencies)
+    # These are used to construct the Gaussian kernel in frequency space
+    freq_y = np.fft.fftfreq(h)[:, np.newaxis]
+    freq_x = np.fft.fftfreq(w)
+    # Square frequencies once for efficiency
+    freq_sq = (freq_y**2, freq_x**2)
+
+    for sigma, w_val in zip(sigmas, weights):
+        if w_val <= 0: continue
+
+        # 1. Generate unique noise for this octave
+        n = rng.uniform(-0.5, 0.5, shape).astype("float32")
+
+        # 2. Apply the blur via FFT
+        s_y, s_x = sigma * stretch[0], sigma * stretch[1]
+
+        # Move to frequency domain
+        n_fft = np.fft.fft2(n)
+
+        # Construct the Gaussian Transfer Function: H(u,v) = exp(-2 * pi^2 * sigma^2 * f^2)
+        # Note: 2 * pi^2 is the scaling constant for standard deviation in freq space
+        kernel = np.exp(-2 * (np.pi**2) * (s_y**2 * freq_sq[0] + s_x**2 * freq_sq[1]))
+
+        # Point-wise multiply and return to spatial domain
+        n = np.fft.ifft2(n_fft * kernel).real
+
+        # 3. Per-Octave Normalization
+        n_min, n_max = n.min(), n.max()
+        if n_max - n_min > 1e-6:
+            n = (n - n_min) / (n_max - n_min)
+
+        # 4. Add to composite based on weight
+        out += float(w_val) * n
+
+    # 5. Final Global Normalization
+    mn, mx = out.min(), out.max()
+    if mx - mn > 1e-6:
+        out = (out - mn) / (mx - mn)
+
+    return out.astype("float32")
+
+def generate_fbm_noise_tile1(
         shape: tuple[int, int], *, sigmas: tuple[float, ...] = (1.5, 4.0, 10.0),
         weights: tuple[float, ...] = (0.4, 0.3, 0.3), stretch: tuple[float, float] = (1.0, 1.0),
         seed: int = 42

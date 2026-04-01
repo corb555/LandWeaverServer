@@ -1,5 +1,7 @@
 # Changelog
 
+- 2.1 [PERF] Improved Noise creation speed
+- 2.0 [STABILITY] Combined Factor and Logic config sections.
 - 1.9 [STABILITY] Added detailed render config verification
 - 1.8 [FEAT] Added ability to add/delete pipeline steps without restarting pipeline
 - 1.7 [STABILITY] Refactored project into a Pipeline package, Render Package and a Common package.

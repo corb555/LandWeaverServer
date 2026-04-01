@@ -1,17 +1,16 @@
 # engine_resources.py
 from contextlib import ExitStack
 import multiprocessing as mp
-import signal
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from Common.ipc_packets import JOB_ID_IDLE
 from Pipeline.job_context import JobContextStore
-from Pipeline.job_loops import render_loop, reader_loop, writer_loop
+from Pipeline.job_loops import worker_loop, reader_loop, writer_loop
 from Pipeline.shared_memory import PoolSpec, SharedMemoryPool, SlotRegistry
 from Pipeline.system_config import SystemConfig
 from Render.noise_library import NoiseLibrary
+
 
 # engine_resources.py
 
@@ -31,28 +30,22 @@ class EngineResources:
         # TODO NOISE LIBRARY SHOULD NOT BE IN ENGINE RESOURCES
         self.noise_lib: Optional['NoiseLibrary'] = None
 
+        self.ctx_mp = mp.get_context("spawn")
+
         # IPC Queues
-        self.status_q = None
-        self.read_q = None
-        self.work_q = None
-        self.writer_q = None
-        self.response_q = None
+        self.status_q = self.ctx_mp.Queue()
+        self.reader_q = self.ctx_mp.Queue()
+        self.worker_q = self.ctx_mp.Queue()
+        self.writer_q = self.ctx_mp.Queue()
+        self.response_q = self.ctx_mp.Queue()
 
         # Process Handles
         self.reader_procs: List[mp.Process] = []
-        self.renderer_procs: List[mp.Process] = []
+        self.worker_procs: List[mp.Process] = []
         self.writer_proc: Optional[mp.Process] = None
 
-    def setup_engine(self) -> None:
+    def start(self) -> None:
         print("[EngineResources] Performing Cold Boot...")
-        ctx_mp = mp.get_context("spawn")
-
-        # 1. Initialize Queues
-        self.status_q = ctx_mp.Queue()
-        self.read_q = ctx_mp.Queue()
-        self.work_q = ctx_mp.Queue()
-        self.writer_q = ctx_mp.Queue()
-        self.response_q = ctx_mp.Queue()
 
         # 2. Shared Memory Context Side-channel
         self.ctx_store = JobContextStore()
@@ -70,23 +63,23 @@ class EngineResources:
         # 4. Spawn Workers
         shm_name = self.ctx_store.shm.name
 
-        self.reader_procs = [ctx_mp.Process(
-            target=reader_loop, args=(self.read_q, self.status_q, shm_name, self.pool_map),
+        self.reader_procs = [self.ctx_mp.Process(
+            target=reader_loop, args=(self.reader_q, self.status_q, shm_name, self.pool_map),
             name=f"RasterRead_{i}"
         ) for i in range(self.system_params.get("reader_count"))]
 
-        self.renderer_procs = [ctx_mp.Process(
-            target=render_loop,
-            args=(self.work_q, self.writer_q, self.status_q, shm_name, self.output_pool,
+        self.worker_procs = [self.ctx_mp.Process(
+            target=worker_loop,
+            args=(self.worker_q, self.writer_q, self.status_q, shm_name, self.output_pool,
                   self.pool_map), name=f"RasterRender_{i}"
         ) for i in range(self.system_params.get("renderer_count"))]
 
-        self.writer_proc = ctx_mp.Process(
+        self.writer_proc = self.ctx_mp.Process(
             target=writer_loop, args=(self.writer_q, self.status_q, shm_name, self.output_pool),
             name="RasterWrite_1"
         )
 
-        for proc in self.reader_procs + self.renderer_procs + [self.writer_proc]:
+        for proc in self.reader_procs + self.worker_procs + [self.writer_proc]:
             proc.start()
 
         print(f"[EngineResources] Workers HOT. SHM Store: {shm_name}")
@@ -184,10 +177,63 @@ class EngineResources:
         print("-" * 60 + "\n")
 
     def manage_noise_library(self, noise_lib: 'NoiseLibrary'):
-        """Register the noise library for automatic unlinking on shutdown."""
+        """
+        Registers the noise library. If a library was already active,
+        it is unlinked immediately to prevent memory accumulation.
+        """
+        if self.noise_lib is not None:
+            # FACT: If we are replacing the library, the old SHM segments
+            # are now 'orphans'. We must unlink them now.
+            print("   - Unlinking superseded Noise Library...")
+            try:
+                self.noise_lib.cleanup(unlink=True)
+            except Exception as e:
+                print(f"   ⚠️  Warning unlinking old noise library: {e}")
+
         self.noise_lib = noise_lib
-        # Register the cleanup with the stack (unlink=True because we are the owner)
-        self.stack.callback(noise_lib.cleanup, unlink=True)
+
+
+    def cleanup(self):
+        """
+        Hard reclamation of all physical resources.
+        Unlinks Shared Memory and closes IPC handles.
+        """
+        if self._cleaned:
+            return
+
+        print("\n[EngineResources] Cleaning up all resources...")
+
+        # 1. NOISE CLEANUP (Manual & Immediate)
+        # We do this BEFORE closing the stack to ensure names are unlinked
+        # while the process is still fully 'alive' in the OS sense.
+        if self.noise_lib:
+            print("   - Unlinking active Noise Library segments...")
+            try:
+                self.noise_lib.cleanup(unlink=True)
+                self.noise_lib = None
+            except Exception as e:
+                print(f"   ⚠️  Noise cleanup error: {e}")
+
+        # 2. PHYSICAL RESOURCE UNLINK (ExitStack)
+        # This unlinks the Driver Pools and the Context Store.
+        try:
+            print("   - Unlinking Driver Pools and closing IPC...")
+            self.stack.close()
+        except Exception as e:
+            print(f"   ⚠️  Warning during ExitStack closure: {e}")
+
+        # 3. REFERENCE CLEARING
+        self.pool_map.clear()
+        self.output_pool = None
+        self.registry = None
+        self.ctx_store = None
+        self.status_q = None
+        self.reader_q = None
+        self.worker_q = None
+        self.writer_q = None
+
+        self._cleaned = True
+        print("✅ [EngineResources] Cleanup complete.")
 
     def update_context(self, job_id: str, reader_data, worker_data, writer_data):
         """
@@ -229,11 +275,11 @@ class EngineResources:
         Unlinks Shared Memory and closes IPC handles.
         """
         if self._cleaned:
-            return # Prevent double-cleanup noise
+            return  # Prevent double-cleanup noise
 
         print("\n[EngineResources] Cleaning up all resources...")
 
-        # 1. THE NUCLEAR STEP: Close the ExitStack
+        # 1.  Close the ExitStack
         # This triggers all .unlink() and .close() callbacks registered
         # during setup_engine().
         try:
@@ -254,8 +300,8 @@ class EngineResources:
 
         # Clear queue references
         self.status_q = None
-        self.read_q = None
-        self.work_q = None
+        self.reader_q = None
+        self.worker_q = None
         self.writer_q = None
 
         self._cleaned = True

@@ -5,12 +5,20 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Optional, Tuple, Set, FrozenSet, List, Dict, Protocol
 
+import numpy as np
+
 DEFAULT_BUFFER = "canvas"
 
 DriverKey = str
 SurfaceKey = str
 FactorKey = str
 
+
+DTYPE_ALIASES = {
+    "uint8": np.uint8, "ubyte": np.uint8, "byte": np.uint8, "int16": np.int16, "uint16": np.uint16,
+    "int32": np.int32, "uint32": np.uint32, "float32": np.float32, "float": np.float32,
+    "float64": np.float64, "double": np.float64,
+}
 
 class FileKey(StrEnum):
     """Non-driver file keys stored under `cfg['files']`."""
@@ -150,7 +158,6 @@ class RequiredResources:
     logic_hash: str = ""
     style_hash: str = ""
     topology_hash: str = ""
-
 
     def with_hashes(
             self, geography_hash: str, hashes: dict

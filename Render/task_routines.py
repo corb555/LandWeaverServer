@@ -5,13 +5,12 @@ import rasterio
 from rasterio.windows import Window
 from scipy.ndimage import gaussian_filter
 
-from Common.ipc_packets import RenderPacket, WriterPacket, BlockReadPacket
+from Common.ipc_packets import RenderPacket, WriterPacket, BlockReadPacket, WindowRect
 from Pipeline.worker_contexts import WorkerContext, WriterContext
 from Render.compositing_engine import CompositingEngine
 from Render.factor_engine import FactorEngine
 from Render.noise_library import NoiseLibrary
 from Render.surface_engine import SurfaceEngine
-from Render.utils import window_from_rect
 
 
 def read_task(packet: BlockReadPacket, io_manager, data_buffer, mask_buffer):
@@ -130,16 +129,14 @@ class RenderWorkspace:
         # 1. TOPOLOGY OR LOGIC CHANGED
         # If the structure of the pipeline or the math logic changes,
         # we must rebuild the FactorEngine.
-        if (res.topology_hash != self.current_topology_hash or
-            res.logic_hash != self.current_logic_hash or
-            self.current_logic_hash is None):
-
+        if (
+                res.topology_hash != self.current_topology_hash or res.logic_hash !=
+                self.current_logic_hash or self.current_logic_hash is None):
             noise_lib = NoiseLibrary(ctx.render_cfg, ctx.render_cfg.noises)
             noise_lib.attach_providers_shm()
 
             self.factor_eng = FactorEngine(
-                ctx.render_cfg, ctx.themes, noise_lib,
-                ctx.render_cfg.factors, res, None
+                ctx.render_cfg, ctx.themes, noise_lib, ctx.render_cfg.factors, res, None
             )
             self.current_topology_hash = res.topology_hash
             self.current_logic_hash = res.logic_hash
@@ -313,3 +310,8 @@ def print_statistics(stats: dict, proc_start: float, launch_elapsed: float, regi
         print("\nACTION: Pipeline is well-balanced.")
 
     print("=" * 60 + "\n")
+
+
+def window_from_rect(r: WindowRect) -> Window:
+    col, row, w, h = r
+    return Window(col, row, w, h)

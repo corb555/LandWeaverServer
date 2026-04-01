@@ -9,6 +9,31 @@ Unlike standard GIS tools that often produce clinical or "blocky" results, Thema
 **physics of aesthetics**. It utilizes a sophisticated toolkit of procedural noise, multi-scale Gaussian
 filters, and non-linear signal shaping to simulate natural transitions, geological grit, and biological density.
 
+an interactive GIS-native procedural surfacing system
+
+drivers: GIS aligned inputs
+factors: computed masks/signals
+surfaces: color/material sources
+pipeline: ordered compositing logic
+noise: multi-scale FBM noise generation
+
+supports both:
+continuous signals - like elevation, precipitation, forest density, lithology
+categorical overlays
+
+ordered pipeline with intermediate surfaces/buffers
+data-driven
+cartographically intentional
+modular 
+
+a strict declarative structure
+named factors/surfaces/pipeline stages
+reproducible text configs
+fast preview feedback
+
+composite operations:
+
+
 ## The Organic Transition
 
 Thematic Render solves the "Low-Res Data Problem" common in spatial visualization. Through a two-phase processing
@@ -212,7 +237,6 @@ The QML maps each class ID to:
 - a text label
 - an intended RGB color
 
-
 If multiple theme drivers are used in the same render configuration, their category labels must be globally unique so
 that per-category configuration remains unambiguous.
 Theme drivers are defined in:
@@ -246,7 +270,7 @@ outwash: { smoothing_radius: 6.0 }
 _default_: { smoothing_radius: 3.0 }
 
 theme_render:
- 
+
 water:
 enabled: true
 blur_px: 3.0
@@ -268,22 +292,21 @@ max_opacity: 0.8
       contrast: 2.0
       max_opacity: 0.8
 
-## Render Settings Hierarchy
+## Render Settings 
 
-
-| YAML Section          | Primary Connection          | Dependency Type   | Purpose                                           |
-|:----------------------|:----------------------------|:------------------|:--------------------------------------------------|
-| **files**             | **driver_specs**            | Physical Path     | Maps unique keys to static files (e.g., QML).     |
-| **prefixed_files**    | **driver_specs**            | Physical Path     | Maps keys to regional TIFFs (e.g., _DEM.tif).     |
-| **driver_specs**      | **factors**                 | Spatial Identity  | Defines memory/dtype for math inputs.             |
-| **logic**             | **factors**                 | Math Constants    | Stores `start/full` values and `noise_amp`.       |
-| **factors**           | **surfaces**                | Functional Input  | Transforms raw data into 0..1 alpha signals.      |
-| **noise_profiles**    | **factors** & **modifiers** | Frequency Data    | Defines the organic "look" of biomes and grit.    |
-| **theme_render**      | **factors**                 | Category Tuning   | Specifically drives the `theme_composite` factor. |
-| **theme_smoothing**   | **theme_render**            | Geometry Fix      | Defines how blocky GIS pixels are rounded.        |
-| **surface_modifiers** | **surfaces**                | Pixel Shift       | Defines RGB hue-shifting (mottling) profiles.     |
-| **surfaces**          | **pipeline**                | RGB Source        | Combines Ramps + Mottling into image layers.      |
-| **pipeline**          | **OUTPUT**                  | Composition       | The final list of steps to blend RGB with Alpha.  |
+| YAML Section          | Primary Connection          | Dependency Type  | Purpose                                           |
+|:----------------------|:----------------------------|:-----------------|:--------------------------------------------------|
+| **files**             | **driver_specs**            | Physical Path    | Maps unique keys to static files (e.g., QML).     |
+| **prefixed_files**    | **driver_specs**            | Physical Path    | Maps keys to regional TIFFs (e.g., _DEM.tif).     |
+| **driver_specs**      | **factors**                 | Spatial Identity | Defines memory/dtype for math inputs.             |
+| **logic**             | **factors**                 | Math Constants   | Stores `start/full` values and `noise_amp`.       |
+| **factors**           | **surfaces**                | Functional Input | Transforms raw data into 0..1 alpha signals.      |
+| **noise_profiles**    | **factors** & **modifiers** | Frequency Data   | Defines the organic "look" of biomes and grit.    |
+| **theme_render**      | **factors**                 | Category Tuning  | Specifically drives the `theme_composite` factor. |
+| **theme_smoothing**   | **theme_render**            | Geometry Fix     | Defines how blocky GIS pixels are rounded.        |
+| **surface_modifiers** | **surfaces**                | Pixel Shift      | Defines RGB hue-shifting (mottling) profiles.     |
+| **surfaces**          | **pipeline**                | RGB Source       | Combines Ramps + Mottling into image layers.      |
+| **pipeline**          | **OUTPUT**                  | Composition      | The final list of steps to blend RGB with Alpha.  |
 
 ```mermaid
 graph TD

@@ -1,13 +1,13 @@
+from collections.abc import Callable
 import multiprocessing
 import signal
-import sys
 import traceback
-from typing import Optional
+from typing import Optional, TypeVar
 
 import setproctitle
 
 from Common.ipc_packets import WriterPacket, JobDonePacket, TileWrittenPacket, Op, Envelope, \
-    ErrorPacket, send_error, BlockLoadedPacket, SEV_CANCEL, SEV_FATAL
+    BlockLoadedPacket, send_cancel_error, send_fatal_error
 from Pipeline.engine_resources import JobContextStore
 from Pipeline.worker_context_base import (close_worker_ctx, sync_ctx_for_packet, )
 from Pipeline.worker_contexts import WriterContext, WorkerContext, ReaderContext
@@ -15,23 +15,24 @@ from Render.task_routines import write_task, read_task, render_task, RenderWorks
 
 
 # job_loops.py
-def process_setup(shm_name):
+def process_setup(shm_name) -> JobContextStore:
     # Create a unique process name
     setproctitle.setproctitle(multiprocessing.current_process().name)
 
-    #Ignore keyboard interrupts.
+    # Ignore keyboard interrupts.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    # Return shared memory
+    #  shared memory
     return JobContextStore(name=shm_name)
 
-def reader_loop(read_q, status_q, shm_name: str, pool_map) -> None:
+
+def reader_loop(reader_q, status_q, shm_name: str, pool_map) -> None:
     section = "READER"
     shm_store = process_setup(shm_name)
     ctx: Optional[ReaderContext] = None
 
     while True:
-        envelope: Envelope = read_q.get()
+        envelope: Envelope = reader_q.get()
         if envelope.op == Op.SHUTDOWN: break
 
         if envelope.op == Op.LOAD_BLOCK:
@@ -45,17 +46,17 @@ def reader_loop(read_q, status_q, shm_name: str, pool_map) -> None:
             if ctx is None: continue
 
             try:
-                # 2. Resource Management (The 'Slot' level)
+                # 2. Resource Management
                 # The Loop is responsible for the Pool and SHM logic
                 pool = pool_map[packet.driver_id]
                 data_view = pool.data_buf[packet.target_slot_id]
                 mask_view = pool.mask_buf[packet.target_slot_id]
 
-                # 3. Execution (The 'Buffer' level)
-                # We pass the pure NumPy views to the Science layer
+                # 3. Execution
+                # We pass the pure NumPy views to the render layer
                 duration = read_task(packet, ctx.io, data_view, mask_view)
 
-                # 4. IPC Feedback
+                # 4. Send DONE
                 status_q.put(
                     Envelope(
                         op=Op.BLOCK_LOADED, payload=BlockLoadedPacket(
@@ -65,67 +66,36 @@ def reader_loop(read_q, status_q, shm_name: str, pool_map) -> None:
                     )
                 )
             except (ValueError, FileNotFoundError, OSError) as exc:
-                # JOB-LEVEL FAILURE
-                # We log it, notify Orch to cancel the job, but KEEP the reader alive.
-                payload = ErrorPacket(
-                    job_id=packet.job_id, tile_id=packet.tile_id, section=section,
-                    severity=SEV_CANCEL,
-                    message=f"{section} Error on {packet.driver_id.value}: {exc}"
-                )
-                send_error(status_q, payload)
-
-            except Exception as e:
-                # SYSTEM-LEVEL FAILURE
-                # Something is fundamentally broken. Report and exit this process.
-                import traceback
+                send_cancel_error(
+                    status_q=status_q, packet=packet, section=section, message=str(exc)
+                    )
+            except Exception as exc:
                 traceback.print_exc()
-
-                payload = ErrorPacket(
-                    job_id=packet.job_id if packet else "unknown",
-                    tile_id=packet.tile_id if packet else -1, section=section, severity=SEV_FATAL,
-                    message=f"CRITICAL: {type(e).__name__}: {e}"
-                )
-                send_error(status_q, payload)
+                send_fatal_error(
+                    status_q=status_q, packet=packet, section=section, exc=exc,
+                    include_traceback=False
+                    )
                 break  # Exit loop, process dies
-
             finally:
                 close_worker_ctx(ctx)
 
-def load_reader_job_ctx(job_id: str, shm_store: JobContextStore) -> ReaderContext:
-    """Load the reader context for a specific job from shared job storage."""
-    try:
-        return shm_store.get_reader_context(job_id)
-    except Exception as exc:
-        raise RuntimeError(
-            f"[READER] Failed to load ReaderContext for job '{job_id}': {exc}"
-        ) from exc
 
-def load_worker_job_ctx(job_id: str, shm_store: JobContextStore) -> WorkerContext:
-    """Load the worker context for a specific job from shared job storage."""
-    try:
-        return shm_store.get_worker_context(job_id)
-    except Exception as exc:
-        raise RuntimeError(
-            f"[RENDER] Failed to load WorkerContext for job '{job_id}': {exc}"
-        ) from exc
-
-
-def render_loop(work_q, writer_q, status_q, shm_name, out_pool, pool_map):
+def worker_loop(worker_q, writer_q, status_q, shm_name, out_pool, pool_map):
     shm_store = process_setup(shm_name)
     ctx: Optional[WorkerContext] = None
     workspace = RenderWorkspace()
+    section = "RENDER"
 
     while True:
-        envelope = work_q.get()
+        envelope = worker_q.get()
         packet = envelope.payload
-        section = "sync ctx"
         try:
             match envelope.op:
                 case Op.RENDER_TILE:
                     try:
                         ctx = sync_ctx_for_packet(
-                        ctx=ctx, packet_job_id=packet.job_id, shm_store=shm_store, load_ctx=load_worker_job_ctx,
-                        err_prefix="WORKER"
+                            ctx=ctx, packet_job_id=packet.job_id, shm_store=shm_store,
+                            load_ctx=load_worker_job_ctx, err_prefix="WORKER"
                         )
                         if ctx is None: continue
 
@@ -137,64 +107,31 @@ def render_loop(work_q, writer_q, status_q, shm_name, out_pool, pool_map):
                             pool_map=pool_map
                         )
                         writer_q.put(Envelope(op=Op.WRITE_TILE, payload=result))
-                    except (ValueError, OSError, KeyError) as e:
-                        # SEV_CANCEL: Notify Orch, but STAY in the while loop
-                        payload = ErrorPacket(
-                            job_id=packet.job_id, tile_id=-1, section="", severity=SEV_CANCEL,
-                            message=f"Render {section} error: '{e}'"
-                        )
-                        send_error(status_q, payload)
-                    except Exception as e:
-                        # SEV_FATAL: Notify Orch and EXIT the process
-                        stack_trace_str = traceback.format_exc()
-                        payload = ErrorPacket(
-                            job_id=packet.job_id, tile_id=-1, section="excep", severity=SEV_FATAL,
-                            message=f"Render {section} Error {e} {stack_trace_str}"
-                        )
-                        send_error(status_q, payload)
+                    except (ValueError, OSError, KeyError) as exc:
+                        send_cancel_error(
+                            status_q=status_q, packet=packet, section=section, message=str(exc)
+                            )
+                    except Exception as exc:
+                        traceback.print_exc()
+                        send_fatal_error(
+                            status_q=status_q, packet=packet, section=section, exc=exc,
+                            include_traceback=False
+                            )
                         break
-
                 case Op.SHUTDOWN:
                     if ctx: ctx.close_local_resources()
                     break
-
                 case Op.JOB_CANCEL:
                     # Passive workers just return to get()
                     continue
-
-                # UNKNOWN MESSAGES
-                case _:
-                    payload = ErrorPacket(
-                        job_id=packet.job_id, tile_id=-1, section=section, severity=SEV_FATAL,
-                        message=f"{section} Unknown message rcvd"
-                    )
-                    send_error(status_q, payload)
-        except ValueError as e:
-            print(f"{section} RENDER1 ERROR {e}")
-            payload = ErrorPacket(
-                job_id=packet.job_id, tile_id=-1, section=section, severity=SEV_CANCEL,
-                message=f"Warning: {e}"
-            )
-            send_error(status_q, payload)
-        except MemoryError as e:
-            print(f"{section} RENDER2 Exception {e}")
-            payload = ErrorPacket(
-                job_id=packet.job_id, tile_id=-1, section=section, severity=SEV_FATAL,
-                message=f"Fatal: {e}"
-            )
-            send_error(status_q, payload)
-            sys.exit(1)
-
-
-def load_writer_job_ctx(job_id: str, shm_store: JobContextStore) -> WriterContext:
-    """Load the writer context for a specific job from shared job storage."""
-    section = "WRITER - load job ctx"
-    try:
-        return shm_store.get_writer_context(job_id)
-    except Exception as exc:
-        raise RuntimeError(
-            f"{section} Failed to load WriterContext for job '{job_id}': {exc}"
-        ) from exc
+        except ValueError as exc:
+            send_cancel_error(status_q=status_q, packet=packet, section=section, message=str(exc))
+        except Exception as exc:
+            traceback.print_exc()
+            send_fatal_error(
+                status_q=status_q, packet=packet, section=section, exc=exc, include_traceback=False
+                )
+            break
 
 
 def writer_loop(write_q, status_q, shm_name: str, out_pool) -> None:
@@ -210,7 +147,6 @@ def writer_loop(write_q, status_q, shm_name: str, out_pool) -> None:
                 case Op.WRITE_TILE:
                     try:
                         packet: WriterPacket = envelope.payload
-                        old_ctx_id = id(ctx)
                         ctx = sync_ctx_for_packet(
                             ctx=ctx, packet_job_id=packet.job_id, shm_store=shm_store,
                             load_ctx=load_writer_job_ctx, err_prefix=section, )
@@ -224,27 +160,16 @@ def writer_loop(write_q, status_q, shm_name: str, out_pool) -> None:
                         status_q.put(Envelope(op=Op.TILE_WRITTEN, payload=payload))
 
                     except (ValueError, FileNotFoundError, OSError) as exc:
-                        # Notify Orch so it can transition to CANCELLING
-                        payload = ErrorPacket(
-                            job_id=packet.job_id, tile_id=packet.tile_id, section=section,
-                            severity=SEV_CANCEL, message=str(exc)
-                        )
-                        send_error(status_q, payload)
-
-                    except Exception as e:
-                        # SYSTEM-LEVEL FAILURE
-                        # Something is fundamentally broken. Report and exit this process.
-                        import traceback
+                        send_cancel_error(
+                            status_q=status_q, packet=packet, section=section, message=str(exc)
+                            )
+                    except Exception as exc:
                         traceback.print_exc()
-
-                        payload = ErrorPacket(
-                            job_id=packet.job_id if packet else "unknown",
-                            tile_id=packet.tile_id if packet else -1, section=section,
-                            severity=SEV_FATAL, message=f"CRITICAL: {type(e).__name__}: {e}"
-                        )
-                        send_error(status_q, payload)
+                        send_fatal_error(
+                            status_q=status_q, packet=packet, section=section, exc=exc,
+                            include_traceback=False
+                            )
                         break
-
                 case Op.JOB_DONE | Op.JOB_CANCEL:
                     is_cancel = (envelope.op == Op.JOB_CANCEL)
                     packet: JobDonePacket = envelope.payload
@@ -253,13 +178,13 @@ def writer_loop(write_q, status_q, shm_name: str, out_pool) -> None:
                         # 1. Close the file handle
                         ctx.close_local_resources()
 
-                        # 2. If CANCELLED, delete the partial file per spec 5.2
+                        # 2. If CANCELLED, delete the partial file
                         if is_cancel:
                             try:
                                 if ctx.output_path.exists():
                                     ctx.output_path.unlink()
-                            except Exception as e:
-                                print(f"⚠️ [Writer] Failed to delete cancelled file: {e}")
+                            except Exception as exc:
+                                print(f"⚠️ [Writer] Failed to delete cancelled file: {exc}")
 
                             # 3. THE HANDSHAKE: Notify Orch that cleanup is done
                             status_q.put(Envelope(op=Op.WRITER_ABORTED, payload=packet.job_id))
@@ -276,22 +201,51 @@ def writer_loop(write_q, status_q, shm_name: str, out_pool) -> None:
                         # unlink on shutdown to prevent artifacts
                         if ctx.output_path.exists(): ctx.output_path.unlink()
                     break
-
-                case _:
-                    payload = ErrorPacket(
-                        "-1", -1, section, severity=SEV_FATAL,
-                        message=f"Unknown OpCode: {envelope.op!r}"
-                    )
-                    send_error(status_q, payload)
-
-    except Exception as e:
-        # SYSTEM-LEVEL FAILURE
-        # Something is fundamentally broken. Report and exit this process.
-        import traceback
+    except Exception as exc:
         traceback.print_exc()
+        send_fatal_error(
+            status_q=status_q, packet=packet, section=section, exc=exc, include_traceback=False
+            )
 
-        payload = ErrorPacket(
-            job_id=packet.job_id if packet else "unknown", tile_id=packet.tile_id if packet else -1,
-            section=section, severity=SEV_FATAL, message=f"CRITICAL: {type(e).__name__}: {e}"
-        )
-        send_error(status_q, payload)
+
+T_CONTEXT = TypeVar("T_CONTEXT")
+
+
+def _load_job_ctx(
+        job_id: str, shm_store: JobContextStore, *, role: str,
+        loader: Callable[[str], T_CONTEXT], ) -> T_CONTEXT:
+    """Load a job-specific context from shared job storage.
+
+    Args:
+        job_id: Unique job identifier.
+        shm_store: Shared job context store.
+        role: Human-readable worker role used in error messages.
+        loader: Bound context-loader callable from ``JobContextStore``.
+
+    Returns:
+        The requested job context.
+
+    Raises:
+        RuntimeError: If the context cannot be loaded.
+    """
+    try:
+        return loader(job_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"[{role}] Failed to load job context for job '{job_id}': {exc}"
+        ) from exc
+
+
+def load_reader_job_ctx(job_id: str, shm_store: JobContextStore) -> ReaderContext:
+    return _load_job_ctx(
+        job_id, shm_store, role="READER", loader=shm_store.get_reader_context, )
+
+
+def load_worker_job_ctx(job_id: str, shm_store: JobContextStore) -> WorkerContext:
+    return _load_job_ctx(
+        job_id, shm_store, role="WORKER", loader=shm_store.get_worker_context, )
+
+
+def load_writer_job_ctx(job_id: str, shm_store: JobContextStore) -> WriterContext:
+    return _load_job_ctx(
+        job_id, shm_store, role="WRITER", loader=shm_store.get_writer_context, )

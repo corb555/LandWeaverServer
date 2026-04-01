@@ -53,28 +53,20 @@ class ThemeTileContext:
     active_specs: list[ThemeRuntimeSpec]
     masks_by_id: Dict[int, np.ndarray]
 
-
 class ThemeRegistry:
     """Registry for categorical theme metadata and runtime rendering specs."""
 
     def __init__(self, cfg: Any):
-        """Initialize the registry.
-
-        Args:
-            cfg: Render configuration.
-        """
-        self.cfg = None  # cfg
-        self.brs_count = 0
-
-        # QML-derived metadata.
+        self.cfg = None
+        # Identity Mappings
         self._name_to_id: Dict[str, int] = {}
         self._id_to_color: Dict[int, tuple[int, int, int]] = {}
 
-        # Worker-local heavy state.
+        # Heavy Runtime State
         self.qml_palette: Optional[Any] = None
         self.lut_rgb: Optional[np.ndarray] = None
 
-        # Normalized runtime specs.
+        # Processed Specs
         self._runtime_specs_by_label: Dict[str, ThemeRuntimeSpec] = {}
         self._runtime_specs_by_id: Dict[int, ThemeRuntimeSpec] = {}
 
@@ -94,83 +86,80 @@ class ThemeRegistry:
         return self._runtime_specs_by_id
 
     def load_metadata(self, render_cfg: Any) -> None:
+        """Methodical Ingestion: Extracts theme logic from the factor params."""
         self.cfg = render_cfg
+
+        # 1. QML colors
         qml_path = render_cfg.path("theme_qml")
         if not qml_path or not qml_path.exists():
             raise FileNotFoundError(f"Theme QML not found: {qml_path}")
-
         self.qml_palette = QmlPalette.load(qml_path)
 
+        # 2. Reset Internal Maps
         self._name_to_id.clear()
         self._id_to_color.clear()
         self._runtime_specs_by_label.clear()
         self._runtime_specs_by_id.clear()
 
+        # 3. Synchronize Labels and Colors from QML
         self._name_to_id.update(self.qml_palette.value_by_label)
-
         for value_str, entry in self.qml_palette.entries_by_value.items():
             rgb = _parse_color_attr(entry.color_hex)
-            if rgb is None:
+            if rgb:
+                self._id_to_color[int(value_str)] = rgb
+
+        # We search the factors list for the one that drives theme composition
+        theme_factor = next(
+            (f for f in render_cfg.factors if f.function_id == "theme_composite"),
+            None
+        )
+
+        # 5. BUILD SPECS
+        # If no factor found, we pass an empty dict to use defaults
+        categories_cfg = theme_factor.params if theme_factor else {}
+        self._build_runtime_specs(render_cfg, categories_cfg)
+
+    def _build_runtime_specs(self, render_cfg: Any, categories_cfg: Dict[str, Any]) -> None:
+        """Constructs ThemeRuntimeSpecs from the consolidated categories dictionary."""
+
+        # We iterate over labels found in the QML palette to ensure 100% coverage
+        for label, theme_id in self._name_to_id.items():
+            # Get settings from factor params, fallback to _default_
+            cat_cfg = categories_cfg.get(label)
+            if cat_cfg is None:
                 continue
-            theme_id = int(value_str)
-            self._id_to_color[theme_id] = rgb
 
-        self._build_runtime_specs(render_cfg)
-
-    def _build_runtime_specs(self, render_cfg: Any) -> None:
-        categories_cfg = self._extract_theme_category_config(render_cfg)
-        smoothing_cfg = self._extract_smoothing_config(render_cfg)
-        modifiers_cfg = getattr(render_cfg, "modifiers", {}) or {}
-
-        for label, cat_cfg in categories_cfg.items():
             enabled = cat_cfg.get("enabled", True)
-            if not enabled: continue
+            if not enabled:
+                continue
 
-            if label not in self._name_to_id:
-                raise ValueError(
-                    f"Theme '{label}' is configured but not found in the QML palette."
-                )
-
-            theme_id = self._name_to_id[label]
             rgb = self._id_to_color.get(theme_id, (0, 0, 0))
-            smoothing_radius = float(
-                smoothing_cfg.get(label, smoothing_cfg.get("_default_", {})).get(
-                    "smoothing_radius", 0.0
-                )
-            )
-
-            modifier = modifiers_cfg.get(label)
-            surface_noise_id = getattr(modifier, "noise_id", None) if modifier else None
-            surface_intensity = float(getattr(modifier, "intensity", 0.0)) if modifier else 0.0
-            surface_shift_vector = tuple(
-                getattr(modifier, "shift_vector", (0.0, 0.0, 0.0))
-            ) if modifier else (0.0, 0.0, 0.0)
 
             try:
-                # Only default for safe params otherwise raise error
-                noise_amp = float(cat_cfg.get("noise_amp"))
-                if noise_amp != 0.0:
-                    noise_id = str(cat_cfg.get("noise_id"))
-                else:
-                    noise_id = "none"
-
+                # Build the unified spec containing  Smoothing and Rendering data
                 spec = ThemeRuntimeSpec(
-                    label=label, theme_id=theme_id, rgb=rgb,
-                    max_opacity=float(cat_cfg.get("max_opacity")),
-                    blur_px=float(cat_cfg.get("blur_px", 0.0)), noise_amp=noise_amp,
-                    noise_id=noise_id, contrast=float(cat_cfg.get("contrast", 1.0)),
-                    smoothing_radius=smoothing_radius, surface_noise_id=surface_noise_id,
-                    surface_intensity=surface_intensity,
-                    surface_shift_vector=tuple(float(v) for v in surface_shift_vector),
-                    enabled=bool(enabled), )
-            except MemoryError as e:
-                print(f"Config error for theme_render:{label} - {e}")
-                raise ValueError(f"Config error for theme_render:{label} - {e}")
+                    label=label,
+                    theme_id=theme_id,
+                    rgb=rgb,
+                    # Rendering Params
+                    max_opacity=float(cat_cfg.get("max_opacity", 1.0)),
+                    blur_px=float(cat_cfg.get("blur_px", 0.0)),
+                    noise_amp=float(cat_cfg.get("noise_amp", 0.0)),
+                    noise_id=str(cat_cfg.get("noise_id", "none")),
+                    contrast=float(cat_cfg.get("contrast", 1.0)),
+                    # Smoothing Params
+                    smoothing_radius=float(cat_cfg.get("smoothing_radius", 0.0)),
+                    # Surface Modifiers
+                    surface_noise_id=cat_cfg.get("surface_noise_id"),
+                    surface_intensity=float(cat_cfg.get("surface_intensity", 0.0)),
+                    enabled=True
+                )
 
-            self._runtime_specs_by_label[label] = spec
-            self._runtime_specs_by_id[theme_id] = spec
+                self._runtime_specs_by_label[label] = spec
+                self._runtime_specs_by_id[theme_id] = spec
 
-    # theme_registry.py
+            except Exception as e:
+                raise ValueError(f"❌ Theme Registry Error: [{label}] {e}")
 
     def _extract_theme_category_config(self, render_cfg: Any) -> Dict[str, Any]:
         """
@@ -186,13 +175,11 @@ class ThemeRegistry:
         # 2. Filter: Only return keys that are actual categories defined in QML.
         # This allows you to have keys like 'source_driver' or 'version' in
         # the same block without the spec-builder trying to render them.
-        return {
-            label: params for label, params in theme_render.items()
-            if label in self._name_to_id
-        }
+        return {label: params for label, params in theme_render.items() if
+            label in self._name_to_id}
 
     @staticmethod
-    def _extract_smoothing_config(render_cfg: Any) -> Dict[str, Mapping[str, Any]]:
+    def ZZ_extract_smoothing_config(render_cfg: Any) -> Dict[str, Mapping[str, Any]]:
 
         all_specs = getattr(render_cfg, "theme_smoothing_specs", {}) or {}
         if "theme_smoothing" in all_specs:
@@ -332,90 +319,58 @@ class ThemeRegistry:
         return out
 
 
-def refine_organic_signal_b(
-        mask: np.ndarray, *, spec: ThemeRuntimeSpec, ctx: Any, ) -> np.ndarray:
+def refine_organic_signal(mask: np.ndarray, params: Any, ctx: Any) -> np.ndarray:
     """
-    Refine a theme mask using ThemeRuntimeSpec parameters.
-        NOTE: A and B are identical except A uses the A pattern for passing parameters and
-    B uses the B pattern for passing parameters
+    Artistic Brush: Softens geometry and injects organic variation.
+    Accepts ThemeRuntimeSpec or lib_ctx.spec.params.
     """
+
+    # 1. EXTRACT PARAMS (Handle both Objects and Dicts)
+    def get_p(key, default):
+        if isinstance(params, dict): return params.get(key, default)
+        return getattr(params, key, default)
+
+    blur_px = float(get_p("blur_px", 0.0))
+    noise_amp = float(get_p("noise_amp", 0.0))
+    noise_id = get_p("noise_id", "none")
+    contrast = float(get_p("contrast", 1.0))
+    power_exponent = float(get_p("power_exponent", 0.0))
+    max_opacity = float(get_p("max_opacity", 1.0))
+
+    # 2. THE SKIP CHECK (Performance Optimization)
+    # If all values are at their 'neutral' state, return the mask as-is.
+    is_neutral = (
+            blur_px == 0.0 and noise_amp == 0.0 and contrast == 1.0 and power_exponent == 0.0 and
+            max_opacity == 1.0)
+    if is_neutral:
+        return mask.astype(np.float32)
+
+    # 3. EXECUTION STACK
     signal = mask.astype(np.float32)
 
-    #DEBUG if spec.label == "playa":
-    #    print(f"ROSB {spec.label} opa={spec.max_opacity}")
+    # A. Initial Melt
+    if blur_px > 0.0:
+        signal = gaussian_filter(signal, sigma=blur_px)
 
-    if spec.blur_px > 0.0:
-        signal = gaussian_filter(signal, sigma=spec.blur_px)
-
-    if spec.noise_amp > 0.0:
-        noise_provider = ctx.noises.get(spec.noise_id)
+    # B. Organic Modulation
+    if noise_amp > 0.0 and noise_id != "none":
+        noise_provider = ctx.noises.get(noise_id)
         if noise_provider is None:
-            available = ctx.noises.keys()
-            raise KeyError(
-                f"Missing noise provider for noise id '{spec.noise_id}' for theme '{spec.label}'. "
-                f"Ensure theme_render/categories/{spec.label} noise settings are valid.  Noise "
-                f"providers:"
-                f"{available}"
-            )
+            raise KeyError(f"Unknown noise_id '{noise_id}' requested by refiner.")
 
         noise = np.squeeze(noise_provider.window_noise(ctx.window)).astype(np.float32)
-
-        # Example noise modulation: centered around 1.0
-        signal *= 1.0 + ((noise - 0.5) * 2.0 * spec.noise_amp)
+        # Standard modulation: multiplies signal by 1.0 +/- (noise_amp)
+        signal *= 1.0 + ((noise - 0.5) * 2.0 * noise_amp)
 
     signal = np.clip(signal, 0.0, 1.0)
 
-    if spec.contrast != 1.0:
-        signal = np.power(signal, spec.contrast)
-
-    if spec.noise_id == 1:
-        print(
-            f"DEBUG refine_organic_signal_b {spec.label}: "
-            f"blur_px={spec.blur_px}, "
-            f"noise_amp={spec.noise_amp}, "
-            f"noise_id={spec.noise_id}, "
-            f"contrast={spec.contrast}, "
-            f"max_opacity={spec.max_opacity}"
-        )
-
-    return np.clip(signal * spec.max_opacity, 0.0, 1.0)
-
-
-def refine_organic_signal_a(mask, blur_px, noise_amp, noise_id, contrast, max_opacity, ctx, name):
-    """
-    NOTE: A and B are identical except A uses the A pattern for passing parameters and
-    B uses the B pattern
-    Transforms a clinical GIS mask into a naturalized artistic factor.
-
-    This is the core 'Artistic Brush' of the engine. It supports two modes:
-    1. CRISP Mode (Default): Uses contrast to create sharp, mottled rock patches.
-    2. SILKY Mode (Power): Uses exponential curves for fluid-like transitions (Water).
-    """
-    # Isolate strictly 2D plane
-    signal = np.squeeze(mask).astype(np.float32)
-    params = ctx.cfg.get_logic(name)
-
-    # 1. INITIAL MELT: Soften the upscaled driver geometry
-    if blur_px > 0:
-        signal = gaussian_filter(signal, sigma=blur_px)
-
-    # 2. SIGNAL SHAPING: Resolve the transition curve
-    power_val = float(params.get("power_exponent", 0.0))
-    if power_val > 0:
-        # Smooth:  long, smooth tails
-        signal = np.power(signal, 1.0 / max(power_val, 0.1))
+    # C. Signal Shaping (Contrast or Power)
+    if power_exponent > 0.0:
+        # Smooth mode: creates long, smooth  tails
+        signal = np.power(signal, 1.0 / max(power_exponent, 0.1))
     elif contrast != 1.0:
-        # Crisp: Sharps the edge to create distinct mineral islands
+        # Crisp mode: creates distinct mineral/vegetation islands
         signal = np.clip((signal - 0.5) * contrast + 0.5, 0.0, 1.0)
 
-    # 3. PROCEDURAL TEXTURE: Inject organic variation (Sand-Swept / Grain)
-    if noise_id:
-        noise_provider = ctx.noises.get(noise_id)
-        noise = np.squeeze(noise_provider.window_noise(ctx.window))
-
-        # Math creates a visibility multiplier between (1.0 - noise_amp) and 1.0
-        variation = (1.0 - noise_amp) + (noise * noise_amp)
-        signal = signal * variation
-
-    # 4. FINAL STANDARDIZATION
-    return np.clip(signal, 0.0, 1.0) * max_opacity
+    # D. Final Normalization
+    return np.clip(signal * max_opacity, 0.0, 1.0)

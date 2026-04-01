@@ -100,10 +100,10 @@ Execution Flow - Happy Path:
 
 ```mermaid
 flowchart TD
-A[Client<br/>JOB_REQUEST]
-B[Orchestrator<br/>Queue / start job]
-C[Orchestrator<br/>Manifest + SHM context]
-D[All Processes<br/>Reject stale job_id]
+    A[Client<br/>JOB_REQUEST]
+    B[Orchestrator<br/>Queue / start job]
+    C[Orchestrator<br/>Manifest + SHM context]
+    D[All Processes<br/>Reject stale job_id]
 
     subgraph TILE_LOOP [Per-Tile Loop]
         E[Dispatcher<br/>Prime tiles]
@@ -120,7 +120,6 @@ D[All Processes<br/>Reject stale job_id]
     M[Orchestrator<br/>JOB_DONE]
     N[Writer<br/>TILES_FINALIZED]
     O[Orchestrator<br/>Finish job / next queued]
-
     A --> B --> C --> D --> E
     L --> M
     M --> N --> O

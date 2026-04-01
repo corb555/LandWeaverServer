@@ -78,7 +78,7 @@ def main():
     # 4. Execute Render
     try:
         pipeline_eng.start()
-        print("Engine Closed.")
+        print("❌ Engine Closed due to error. Shutdown completed.")
     except MemoryError as e:
         print(f"\n❌ Pipeline error: {e}")
         import traceback

@@ -7,6 +7,7 @@ Here is a concise summary for this new session with the technical context of the
 A high-performance background service for multi-layer spatial compositing. It uses a **Client/Daemon** architecture over
 a Unix Domain Socket,
 designed to bridge the gap between heavy GIS data and real-time artistic iteration. The Daemon has two major components:
+
 1) the Pipeline Engine/Orchestrator and
 
 2) The Rendering Subsystem. The Pipeline Engine/Orchestrator reads the config, creates and manages shmem, queues, and
@@ -87,26 +88,26 @@ pipeline:
     enabled: true
     comp_op: lerp_surfaces
     factor_nm: lith
-    input_surfaces: [arid_base, arid_red_base]
+    input_surfaces: [ arid_base, arid_red_base ]
     output_surface: arid_composite
 
   - desc: Create the Canvas buffer with the ARID_COMPOSITE surface
     enabled: true
     comp_op: create_buffer
-    input_surfaces: [arid_composite]
+    input_surfaces: [ arid_composite ]
 
   - desc: Diagnostic Blackboard
     enabled: false
     comp_op: create_buffer
     buffer: canvas
     params:
-      color: [214, 212, 195]  
+      color: [ 214, 212, 195 ]
 
   - desc: Add ARID_VEGETATION to the arid region using the forest mask
     enabled: true
     comp_op: lerp
     factor_nm: forest
-    input_surfaces: [arid_vegetation]
+    input_surfaces: [ arid_vegetation ]
     scale: 1.1
     contrast: 0.0
 
@@ -115,7 +116,7 @@ pipeline:
     comp_op: lerp_surfaces
     factor_nm: lith
     scale: 1.0
-    input_surfaces: [humid_base, arid_red_base]
+    input_surfaces: [ humid_base, arid_red_base ]
     output_surface: humid_composite
 ```
 

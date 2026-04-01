@@ -72,7 +72,7 @@ class TileDispatcher:
         self.current_tile_iterator = enumerate(win_list)
         self.flush_queues()
 
-    def prime_pipeline(self, job_id: str) -> List[DispatchResult]:
+    def get_priming_list(self, job_id: str) -> List[DispatchResult]:
         """
         Prepare initial tile dispatches up to the in-flight limit.
 
@@ -80,17 +80,17 @@ class TileDispatcher:
             job_id: Active job identifier.
 
         Returns:
-            A list of dispatch results for the orchestrator to send.
+            A list of dispatch candidates for the orchestrator to send to prime the pipeline
         """
-        results: List[DispatchResult] = []
+        candidates: List[DispatchResult] = []
 
         for _ in range(self.max_tiles_in_flight):
             result = self.dispatch_next_tile(job_id)
             if result.tile_id is None:
                 break
-            results.append(result)
+            candidates.append(result)
 
-        return results
+        return candidates
 
     def dispatch_next_tile(self, job_id: str) -> DispatchResult:
         if self.current_tile_iterator is None or self.current_job_manifest is None:
@@ -220,7 +220,7 @@ class TileDispatcher:
 
     def flush_queues(self) -> None:
         """Best-effort drain of worker input queues before a new job starts."""
-        for q in [self.resources.read_q, self.resources.work_q]:
+        for q in [self.resources.reader_q, self.resources.worker_q]:
             while not q.empty():
                 try:
                     q.get_nowait()

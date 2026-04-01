@@ -6,8 +6,7 @@ from typing import (Any, Dict)
 
 import numpy as np
 
-from Common.keys import DriverKey, DriverRndrSpec, DriverHWSpec
-from Render.utils import DTYPE_ALIASES
+from Common.keys import DriverKey, DriverRndrSpec, DriverHWSpec, DTYPE_ALIASES
 
 
 # system_config.py

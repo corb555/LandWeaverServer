@@ -1,11 +1,12 @@
 from functools import wraps
-from typing import Dict, Callable
+from typing import Dict, Callable, Any
 
 import numpy as np
 
 # factor_library.py
 from Render.spatial_math import normalize_step, lerp
-from Render.theme_registry import refine_organic_signal_a, refine_organic_signal_b
+from Render.theme_registry import refine_organic_signal
+from Render.utils import SAFE_FUNCTIONS
 
 # factor_library.py
 
@@ -44,42 +45,46 @@ def spatial_factor(function_id: str):
 
 def _map_and_refine(data_2d, masks_2d, name, lib_ctx, driver_key):
     """
-    Standard pipeline for 'Remapping' factors (DEM, Precip, Forest).
-    Raw -> Normalize -> Organic Refine -> Masked Default.
+    'Remapping' factors
+    Raw -> Normalize ->  Refine -> Masked Default.
     """
-    params = lib_ctx.cfg.get_logic(name)
-    # 1. Catch the mismatch immediately
-    if not params:
+    params = lib_ctx.spec.params
+
+    # we require start and full.
+    if "start" not in params or "full" not in params:
         raise KeyError(
-            f"Factor '{name}' failed to find its parameters in config"
-            f"Ensure 'driver_logic_params' contains a key named '{name}'."
+            f"Factor '{name}' uses a mapping function but is missing "
+            f"required parameters 'start' and 'full' in its YAML params block."
         )
 
     # Identify the specific driver band requested
-    raw_data = data_2d[driver_key]
+    raw_data = np.squeeze(data_2d[driver_key])
     if raw_data.ndim == 3:
         band_idx = int(params.get("band", 1)) - 1
         raw_plane = raw_data[:, :, band_idx]
     else:
         raw_plane = raw_data
 
-    # 1. Physical Remapping: Linear normalization based on config start/full
-    remaped = normalize_step(raw_plane, float(params.get("start")), float(params.get("full")))
+    # 1. Normalize range: Linear normalization based on config start/full
+    remapped = normalize_step(raw_plane, float(params.get("start")), float(params.get("full")))
 
-    # 2. Organic Naturalization: Blur, Noise, Contrast, and Power-curves
-    refined = refine_organic_signal_a(
-        mask=remaped, blur_px=float(params.get("blur_px", 0.0)),
-        noise_amp=float(params.get("noise_amp", 0.0)), noise_id=params.get("noise_id"),
-        # Uses 'geology', 'biome', etc.
-        contrast=float(params.get("contrast", 1.0)),
-        max_opacity=float(params.get("max_opacity", 1.0)), ctx=lib_ctx, name=name
+    # 2. Blur, Noise, Contrast, and Power-curves
+    refined = refine_organic_signal(
+        mask=remapped, params=lib_ctx.spec.params, ctx=lib_ctx
     )
 
-    # 3. Gating: Handle NoData areas using a default fill value (e.g. 1.0 for Arid moisture)
-    default_val = float(params.get("default_fill", 0.0))
-    valid_mask = np.squeeze(masks_2d[driver_key])
+    # Ensure 'refined' hasn't picked up a trailing (..., 1) dimension
+    # from noise sampling or internal math.
+    refined_2d = np.squeeze(refined)
+    valid_mask_2d = np.squeeze(masks_2d[driver_key])
 
-    return lerp(default_val, refined, valid_mask)
+    # 5. Gating
+    default_val = float(params.get("default_fill", 0.0))
+
+    # 6. Linear Interpolation (Now safe because both are 2D)
+    result_2d = lerp(default_val, refined_2d, valid_mask_2d)
+
+    return result_2d
 
 
 # -----------------------------------------------------------------------------
@@ -87,21 +92,53 @@ def _map_and_refine(data_2d, masks_2d, name, lib_ctx, driver_key):
 # -----------------------------------------------------------------------------
 
 class FactorLibrary:
-
     @staticmethod
-    @spatial_factor("elevation_raw")
-    def elevation_raw(data_2d, masks_2d, name, lib_ctx):
-        """Pass-through for raw physical meters (used for ramp sampling)."""
-        # Get the  driver defined in the spec for this factor
-        driver_key = next(iter(lib_ctx.spec.drivers))
-        return data_2d[driver_key]
+    @spatial_factor("raw_driver")
+    def raw_driver(data_2d, masks_2d, name, lib_ctx):
+        """
+        Identity Operation: Promotes a physical driver to a logical factor.
+
+        This function acts as a 'Semantic Airlock.' It moves raw data from the
+        physical input dictionary (data_2d) to the logical factor dictionary
+        (factors_2d) without modification.
+
+        Architectural Purpose:
+        1. DIMENSIONAL FIREWALL: Ensures the data is squeezed into a strictly
+           2D NumPy array, removing any band or shared-memory slot dimensions.
+        2. STABLE ALIASING: Allows the user to link a logical name (e.g., 'elev_m')
+           to a physical file (e.g., 'terrain_v4.tif') so that changing files
+           doesn't require updating every surface or pipeline step.
+        3. PACKAGE ISOLATION: Allows the Rendering Engines to remain 'blind' to
+           the physical Driver Pool, operating only on the Factor signal dictionary.
+
+        Use Cases:
+        - Providing 'elev_m' (raw meters) as a coordinate for color ramp sampling.
+        - Passing through raw categorical 'theme_ids' for specialized masking.
+        - Exposing raw physics values (like Slope) to the 'expression' factor.
+
+        Drivers: [Target_Driver] (The first driver in the YAML list is used)
+        """
+        # 1. Physical Lookup
+        # We use the explicit driver name provided in the factor's 'drivers' list
+        if not lib_ctx.spec.drivers:
+            raise ValueError(f"Factor '{name}' (raw_driver) requires at least one driver.")
+
+        drv_key = list(lib_ctx.spec.drivers)[0]
+
+        # 2. Extract Data
+        # Use np.squeeze to ensure we fulfill the 2D Firewall contract
+        raw_data = data_2d.get(drv_key)
+
+        if raw_data is None:
+            raise KeyError(f"Factor '{name}' requested driver '{drv_key}', but it is missing from memory.")
+
+        # 3. Direct Return (Identity Math)
+        return np.squeeze(raw_data)
 
     @staticmethod
     @spatial_factor("mapped_signal")
     def mapped_signal(data_2d, masks_2d, name, lib_ctx):
         """
-        Generic entry for Lith, Moisture, Canopy, and Normalized Elevation.
-        Logic is entirely defined by the config params for 'name'.
         """
         driver_key = next(iter(lib_ctx.spec.drivers))
         return _map_and_refine(data_2d, masks_2d, name, lib_ctx, driver_key)
@@ -109,7 +146,6 @@ class FactorLibrary:
     @staticmethod
     @spatial_factor("theme_composite")
     def theme_composite(data_2d, masks_2d, name, lib_ctx):
-        # 1. Identify which driver was assigned to this factor in biome.yml
         # Use the first driver for this factor
         drv_key = list(lib_ctx.spec.drivers)[0]
 
@@ -124,49 +160,73 @@ class FactorLibrary:
             if not np.any(binary_mask):
                 continue
 
-            cat_alpha = refine_organic_signal_b(
-                mask=binary_mask, spec=spec, ctx=lib_ctx, )
+            cat_alpha = refine_organic_signal(
+                mask=binary_mask, params=spec, ctx=lib_ctx
+            )
             composite_alpha = np.maximum(composite_alpha, cat_alpha)
 
         return composite_alpha * np.squeeze(masks_2d[drv_key])
 
     @staticmethod
-    @spatial_factor("hillshade")
-    def hillshade(data_2d, masks_2d, name, lib_ctx):
-        """Luminance-protected hillshade factor."""
+    @spatial_factor("protected_shaping")
+    def protected_shaping(data_2d, masks_2d, name, lib_ctx):
+        """
+        Shapes a grayscale signal into a multiplicative factor while
+        preserving highlights and shadows (mid-tone protection).
+
+        This is used to modulate brightness (e.g. Hillshading or Texturing)
+        without 'crushing' the underlying colors.
+        """
+        params = lib_ctx.spec.params
         driver_key = next(iter(lib_ctx.spec.drivers))
-        raw_hs = data_2d.get(driver_key)
-        if raw_hs is None:
+        raw_signal = data_2d.get(driver_key)
+
+        if raw_signal is None:
             return np.ones(lib_ctx.target_shape, dtype="float32")
 
-        p = lib_ctx.cfg.get_logic("hillshade")
-        val = np.clip(raw_hs / 255.0, 0.0, 1.0)
+        # 1. Normalize Input
+        # 'input_scale' allows handling both 8-bit (255) and float (1.0) drivers
+        scale = float(params.get("input_scale", 255.0))
+        val = np.clip(raw_signal / scale, 0.0, 1.0)
 
-        # Gamma adjustment for shading volume
-        gamma = float(p.get("gamma", 1.0))
+        # 2. Volume Adjustment (Gamma)
+        gamma = float(params.get("gamma", 1.0))
         if gamma != 1.0:
             val = np.power(val, gamma)
 
-        # Apply standard shadow/highlight protection to preserve  colors
-        t_shad = (val - float(p["shadow_start"])) / max(
-            float(p["shadow_end"]) - float(p["shadow_start"]), 1e-6
+        # 3. Protection Logic (The 'Airlock' for colors)
+        # Prevents the signal from pushing pixels to pure black or pure white.
+
+        # Shadow protection:
+        t_low = (val - float(params["low_start"])) / max(
+            float(params["low_end"]) - float(params["low_start"]), 1e-6
         )
-        w_shad = (1.0 - np.clip(t_shad, 0, 1)) * float(p["protect_shadows"])
+        w_low = (1.0 - np.clip(t_low, 0, 1)) * float(params["protect_lows"])
 
-        t_high = (val - float(p["highlight_start"])) / max(
-            float(p["highlight_end"]) - float(p["highlight_start"]), 1e-6
+        # Highlight protection:
+        t_high = (val - float(params["high_start"])) / max(
+            float(params["high_end"]) - float(params["high_start"]), 1e-6
         )
-        w_high = np.clip(t_high, 0, 1) * float(p["protect_highlights"])
+        w_high = np.clip(t_high, 0, 1) * float(params["protect_highs"])
 
-        m_protected = val + np.maximum(w_shad, w_high) * (1.0 - val)
-        m_final = 1.0 + float(p.get("strength", 0.8)) * (m_protected - 1.0)
+        # Combine protection weights and apply to the signal
+        m_protected = val + np.maximum(w_low, w_high) * (1.0 - val)
 
-        return 1.0 + np.squeeze(masks_2d[driver_key]) * (m_final - 1.0)
+        # 4. Strength Scaling
+        # 1.0 is the 'Neutral' state for multiplication.
+        # Strength moves the signal further from or closer to 1.0.
+        strength = float(params.get("strength", 1.0))
+        m_final = 1.0 + strength * (m_protected - 1.0)
+
+        # 5. Validity Masking
+        # Ensures that NoData areas return exactly 1.0 (Multiply by 1.0 = No change)
+        valid_mask = np.squeeze(masks_2d[driver_key])
+        return 1.0 + valid_mask * (m_final - 1.0)
 
     @staticmethod
     @spatial_factor("specular_highlights")
     def specular_highlights(data_2d, masks_2d, name, lib_ctx):
-        params = lib_ctx.cfg.get_logic(name)
+        params = lib_ctx.spec.params
         noise_id = lib_ctx.spec.required_noise
         noise_provider = lib_ctx.noises.get(noise_id)
 
@@ -188,7 +248,7 @@ class FactorLibrary:
     @staticmethod
     @spatial_factor("noise_overlay")
     def noise_overlay(data_2d, masks_2d, name, lib_ctx):
-        params = lib_ctx.cfg.get_logic(name)
+        params = lib_ctx.spec.params
 
         # Use the noise profile defined in the spec (e.g., "water")
         noise_id = lib_ctx.spec.required_noise
@@ -210,14 +270,13 @@ class FactorLibrary:
     @staticmethod
     @spatial_factor("proximity_power")
     def proximity_power(data_2d, masks_2d, name, lib_ctx):
-        params = lib_ctx.cfg.get_logic(name)
+        params = lib_ctx.spec.params
 
         # Use the primary driver from the spec
         driver_key = next(iter(lib_ctx.spec.drivers))
         prox_data = data_2d.get(driver_key)
 
         # Use the dependency defined in the spec (usually "water")
-        # This removes the hardcoded "water" factor lookup
         mask_key = lib_ctx.spec.required_factors[0] if lib_ctx.spec.required_factors else None
         mask = _get_required_factor(lib_ctx, mask_key) if mask_key else 1.0
 
@@ -235,10 +294,10 @@ class FactorLibrary:
         return res * mask
 
     @staticmethod
-    @spatial_factor("categorical_mask")  # renamed to be generic
+    @spatial_factor("categorical_mask")
     def categorical_mask(data_2d, masks_2d, name, lib_ctx):
         # Pull the label from the config for THIS factor (e.g., params['label'] = "water")
-        params = lib_ctx.cfg.get_logic(name)
+        params = lib_ctx.spec.params
         target_label = params.get("label", name)
         drv_key = list(lib_ctx.spec.drivers)[0]
 
@@ -246,7 +305,7 @@ class FactorLibrary:
         if theme_ids is None:
             return np.zeros(lib_ctx.target_shape, dtype="float32")
 
-        # Bridge between YAML logic and QML IDs
+        # Bridge between config logic and QML IDs
         target_val = lib_ctx.theme_registry.name_to_id.get(target_label)
         if target_val is None:
             return np.zeros(lib_ctx.target_shape, dtype="float32")
@@ -255,22 +314,25 @@ class FactorLibrary:
         return (theme_ids == target_val).astype("float32")
 
     @staticmethod
-    @spatial_factor("ZZedge_fade")
-    def ZZedge_fade(data_2d, masks_2d, name, lib_ctx):
+    @spatial_factor("edge_fade")
+    def edge_fade(data_2d, masks_2d, name, lib_ctx):
         """
         Creates an organic alpha transition based on proximity within a specific category.
         Useful for fading water at the shore or thinning forest at the tree-line.
         """
-        params = lib_ctx.cfg.get_logic(name)
+        params = lib_ctx.spec.params
+        # Use the primary driver from the spec
+        driver_key = next(iter(lib_ctx.spec.drivers))
+        prox_data = data_2d.get(driver_key)
+        theme_ids = data_2d.get(driver_key)
 
         # 1. Fetch Drivers from data dictionary
         # Proximity represents distance (in meters or pixels) from a feature boundary
-
         if prox_data is None or theme_ids is None:
             return np.zeros(lib_ctx.target_shape, dtype="float32")
 
         # 2. Identify the target category from Config
-        # Allows this function to work for 'Water', 'Forest', 'Playa', etc.
+        # Allows this function to work for named category
         target_label = params.get("label", name)
         target_id = lib_ctx.theme_registry.name_to_id.get(target_label.lower())
 
@@ -286,7 +348,7 @@ class FactorLibrary:
         alpha = np.clip(prox_data / max(ramp_width, 0.1), 0.0, 1.0)
 
         # 5. Apply Non-linear Shaping (Power Curve)
-        # Allows for 'silky' vs 'hard' transitions
+        # Allows for 'smooth' vs 'hard' transitions
         sensitivity = float(params.get("sensitivity", 1.0))
         if sensitivity != 1.0:
             alpha = np.power(alpha, 1.0 / max(sensitivity, 0.01))
@@ -295,56 +357,133 @@ class FactorLibrary:
         return alpha * binary_mask
 
     @staticmethod
-    @spatial_factor("snow_mask")
-    def snow_mask(data_2d, masks_2d, name, lib_ctx):
+    @spatial_factor("constrained_signal")
+    def constrained_signal(data_2d, masks_2d, name, lib_ctx):
         """
-        Calculates a naturalized snow mask using Apparent Elevation
-        and Slope-based adhesion.
+        Procedural mask generator implementing the 'Apparent Boundary' pattern.
+
+        This function creates organic transitions (like snowlines, tree-lines, or
+        vegetation bands) by combining a primary geographic signal with stochastic
+        jitter, then subjecting the result to a physical constraint.
+
+        Logic Flow:
+        1. PERTURBATION: The primary driver (e.g., Elevation) is displaced by a noise
+           field. This creates 'Apparent Elevation,' where the boundary wanders
+           naturally into valleys or up ridges instead of following rigid contours.
+        2. THRESHOLDING: A smooth linear-step (ramp) is applied to the apparent
+           signal to create a soft probability mask (0..1).
+        3. CONSTRAINT: A secondary driver (e.g., Slope) acts as a physical penalty.
+           If the constraint exceeds a limit (e.g., a cliff is too steep), the
+           signal is stripped away, regardless of elevation.
+
+        Parameters (params):
+            threshold (float): The central value where the transition occurs.
+            ramp (float): The vertical/horizontal width of the fade zone.
+            jitter_amt (float): The maximum distance (in units) the noise wiggles the line.
+            noise_id (str): Reference to the noise_profile for organic wandering.
+            constraint_limit (float): The value where the physical penalty peaks.
+            constraint_fade (float): The softness of the penalty transition.
+            invert_threshold (bool): Optional. If True, signal is 1.0 BELOW threshold.
+
+        Drivers: [Primary_Driver, Constraint_Driver]
         """
-        # 1. Extract Config & Drivers
-        params = lib_ctx.cfg.get_logic(name)
-        # Using the explicit driver mapping from our new architecture
-        elev_key = lib_ctx.spec.drivers[0]  # 'dem'
-        slope_key = lib_ctx.spec.drivers[1] # 'slope'
+        params = lib_ctx.spec.params
 
-        elev = data_2d[elev_key]
-        slope = data_2d[slope_key]
+        # 1. Map Drivers using the explicit indices from the YAML 'drivers' list
+        # Example: [dem, slope] or [proximity, dem]
+        primary_data = data_2d[lib_ctx.spec.drivers[0]]
+        constraint_data = data_2d[lib_ctx.spec.drivers[1]]
 
-        # 2. Get Organic Jitter
-        # We pull the noise field to make the snowline 'wander' naturally
-        noise_id = params.get("noise_id", "empty")
-        noise = lib_ctx.noises.get(noise_id)
-        if noise is None:
-            raise ValueError(f"Noise '{noise_id}' not found")
-        noise = np.squeeze(noise.window_noise(lib_ctx.window))
+        # 2. Generate Organic Jitter (The 'Wandering' component)
+        noise_id = params.get("noise_id", "none")
+        jitter_val = float(params.get("jitter_amt", 0.0))
 
-        # 3. Calculate Effective Elevation
-        # Instead of a flat line, we perturb the elevation with noise.
-        # This creates those natural 'tongues' of snow reaching down into valleys.
-        jitter_m = float(params.get("jitter_m", 100))
-        apparent_elev = elev + ((noise - 0.5) * 2.0 * jitter_m)
+        if noise_id != "none" and jitter_val > 0:
+            noise_provider = lib_ctx.noises.get(noise_id)
+            if noise_provider is None:
+                raise KeyError(f"Factor '{name}' references unknown noise_id '{noise_id}'")
 
-        # 4. Elevation Mask (Smooth transition)
-        # We calculate visibility based on distance from the snowline
-        snowline = float(params.get("snowline_m", 3000))
-        ramp = float(params.get("transition_m", 100))
+            noise = np.squeeze(noise_provider.window_noise(lib_ctx.window))
+            # Transform Primary Data into an Apparent State
+            # (noise-0.5)*2.0 centers the noise around 0.0 (-jitter to +jitter)
+            effective_signal = primary_data + ((noise - 0.5) * 2.0 * jitter_val)
+        else:
+            effective_signal = primary_data
 
-        # Soft-threshold: 0.0 below line, 1.0 above line, smooth fade in-between
-        snow_signal = np.clip((apparent_elev - (snowline - ramp/2)) / ramp, 0.0, 1.0)
+        # 3. Apply Boundary Threshold (The 'Probability' component)
+        threshold = float(params.get("threshold", 0.0))
+        ramp = float(params.get("ramp", 1.0))
+        invert = params.get("invert_threshold", False)
 
-        # 5. Slope Penalty (Physics)
-        # Snow doesn't stick to vertical cliffs.
-        s_thresh = float(params.get("slope_threshold", 35))
-        s_fade = float(params.get("slope_fade", 10))
+        # Calculate linear distance from the edge of the ramp
+        mask = np.clip((effective_signal - (threshold - ramp / 2)) / ramp, 0.0, 1.0)
+        if invert:
+            mask = 1.0 - mask
 
-        # 1.0 on flat ground, 0.0 on steep cliffs.
-        # We fade the snow out as the slope increases.
-        slope_penalty = 1.0 - np.clip((slope - (s_thresh - s_fade)) / s_fade, 0.0, 1.0)
+        # 4. Apply Physical Constraint (The 'Physics' component)
+        # 1.0 is full adhesion; 0.0 is full stripping/penalty.
+        limit = float(params.get("constraint_limit", 90.0))
+        limit_fade = float(params.get("constraint_fade", 1.0))
 
-        # 6. Final Composite
-        # Result = (Organic Elevation Mask) * (Physical Slope Mask)
-        return snow_signal * slope_penalty
+        penalty = 1.0 - np.clip((constraint_data - (limit - limit_fade)) / limit_fade, 0.0, 1.0)
 
+        # 5. Composite Final Factor (Ensure 2D firewall is maintained)
+        return np.squeeze(mask * penalty)
+
+    @staticmethod
+    @spatial_factor("expression")
+    def expression(data_2d, masks_2d, name, lib_ctx):
+        """Evaluate a precompiled safe math expression for the current tile."""
+        code = lib_ctx.expression_cache.get(name)
+        if code is None:
+            raise RuntimeError(f"Expression for '{name}' was not pre-compiled.")
+
+        namespace: dict[str, Any] = dict(SAFE_FUNCTIONS)
+        valid_mask = np.ones(lib_ctx.target_shape, dtype=np.float32)
+
+        for d_key in lib_ctx.spec.drivers or []:
+            arr = np.squeeze(np.asarray(data_2d[d_key], dtype=np.float32))
+            if arr.shape != lib_ctx.target_shape:
+                raise ValueError(
+                    f"Driver '{d_key}' has shape {arr.shape}, "
+                    f"expected {lib_ctx.target_shape}."
+                )
+            namespace[d_key] = arr
+
+            mask = masks_2d.get(d_key)
+            if mask is not None:
+                valid_mask *= np.squeeze(np.asarray(mask, dtype=np.float32))
+
+        for f_key in lib_ctx.spec.required_factors or []:
+            if f_key not in lib_ctx.factors:
+                raise KeyError(
+                    f"Expression '{name}' requires factor '{f_key}', but it is unavailable."
+                )
+            arr = np.squeeze(np.asarray(lib_ctx.factors[f_key], dtype=np.float32))
+            if arr.shape != lib_ctx.target_shape:
+                raise ValueError(
+                    f"Factor '{f_key}' has shape {arr.shape}, "
+                    f"expected {lib_ctx.target_shape}."
+                )
+            namespace[f_key] = arr
+
+        try:
+            result = eval(code, {"__builtins__": {}}, namespace)
+        except Exception as exc:
+            raise RuntimeError(f"Math error in expression '{name}': {exc}") from exc
+
+        result = np.asarray(result, dtype=np.float32)
+
+        if result.shape == ():
+            result = np.full(lib_ctx.target_shape, float(result), dtype=np.float32)
+
+        if result.shape != lib_ctx.target_shape:
+            raise ValueError(
+                f"Expression '{name}' returned shape {result.shape}, "
+                f"expected {lib_ctx.target_shape}."
+            )
+
+        return result * valid_mask
 
 # -----------------------------------------------------------------------------
 # Internal Helpers
