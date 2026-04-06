@@ -5,7 +5,7 @@
 especially when working toward naturalistic, thematic, or presentation-quality maps. 
 
 It combines GIS-aligned raster inputs, computed control masks, procedural texture, and an ordered compositing pipeline to create results that are smoother, richer, and more visually intentional than conventional raster workflows. 
-![Sample LandWeaver render](https://raw.githubusercontent.com/corb555/LandWeaver/main/docs/images/sample_render.png)
+![Sample LandWeaver render](https://github.com/corb555/LandWeaverServer/blob/6ace8f2d3b181e9f80a2c418ab9c9b67b1ee5af3/docs/images/grand%20canyon.png)
 
 *Example output showing naturalized, artistically composited terrain generated from multiple GIS raster inputs.*
 
