@@ -3,7 +3,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict
 
-from Render.theme_registry import refine_organic_signal
+from landweaverserver.render.theme_registry import refine_signal
 
 
 # --- 1. MOCKS & INFRASTRUCTURE ---
@@ -45,7 +45,7 @@ def test_refine_neutral_identity():
     params = {"blur_px": 0, "noise_amp": 0, "contrast": 1.0, "max_opacity": 1.0}
     ctx = MockContext({})
 
-    output = refine_organic_signal(input_mask, params, ctx)
+    output = refine_signal(input_mask, params, ctx)
 
     assert np.array_equal(input_mask, output)
     assert output.dtype == np.float32
@@ -57,7 +57,7 @@ def test_refine_max_opacity():
     params = {"max_opacity": 0.6}
     ctx = MockContext({})
 
-    output = refine_organic_signal(input_mask, params, ctx)
+    output = refine_signal(input_mask, params, ctx)
 
     # Validation:
     # The background (0.0) must remain 0.0
@@ -76,12 +76,12 @@ def test_refine_noise_modulation_math():
 
     # Case A: Max Noise (1.0) -> Expected: 0.5 * (1.0 + 0.5 * 2 * 0.4) = 0.7
     ctx_white = MockContext({"noise": 1.0})
-    out_white = refine_organic_signal(input_mask, {"noise_amp": amp_low, "noise_id": "noise"}, ctx_white)
+    out_white = refine_signal(input_mask, {"noise_amp": amp_low, "noise_id": "noise"}, ctx_white)
     assert np.all(out_white == pytest.approx(0.7))
 
     # Case B: Min Noise (0.0) -> Expected: 0.5 * (1.0 - 0.5 * 2 * 0.4) = 0.3
     ctx_black = MockContext({"noise": 0.0})
-    out_black = refine_organic_signal(input_mask, {"noise_amp": amp_low, "noise_id": "noise"}, ctx_black)
+    out_black = refine_signal(input_mask, {"noise_amp": amp_low, "noise_id": "noise"}, ctx_black)
     assert np.all(out_black == pytest.approx(0.3))
 
     # --- LEVEL 2: Maximum Amplitude (1.0) ---
@@ -89,12 +89,12 @@ def test_refine_noise_modulation_math():
     amp_high = 1.0
 
     # Case C: Max Noise (1.0) -> Expected: 0.5 * (1.0 + 0.5 * 2 * 1.0) = 1.0
-    out_max = refine_organic_signal(input_mask, {"noise_amp": amp_high, "noise_id": "noise"}, ctx_white)
+    out_max = refine_signal(input_mask, {"noise_amp": amp_high, "noise_id": "noise"}, ctx_white)
     assert np.all(out_max == pytest.approx(1.0))
 
     # Case D: Min Noise (0.0) -> Expected: 0.5 * (1.0 - 0.5 * 2 * 1.0) = 0.0
     # This is the "Shredder" test—proves noise can punch transparent holes.
-    out_min = refine_organic_signal(input_mask, {"noise_amp": amp_high, "noise_id": "noise"}, ctx_black)
+    out_min = refine_signal(input_mask, {"noise_amp": amp_high, "noise_id": "noise"}, ctx_black)
     assert np.all(out_min == pytest.approx(0.0))
 
 def test_refine_contrast_shaping():
@@ -104,7 +104,7 @@ def test_refine_contrast_shaping():
     params = {"contrast": 2.0} # Aggressive S-curve
     ctx = MockContext({})
 
-    output = refine_organic_signal(input_mask, params, ctx)
+    output = refine_signal(input_mask, params, ctx)
 
     # 0.5 remains 0.5
     assert output[0, 1] == 0.5
@@ -119,7 +119,7 @@ def test_refine_power_exponent_shaping():
     params = {"power_exponent": 2.0} # Smooth mode
     ctx = MockContext({})
 
-    output = refine_organic_signal(input_mask, params, ctx)
+    output = refine_signal(input_mask, params, ctx)
 
     # Calculation: 0.5 ^ (1.0 / 2.0) = sqrt(0.5) approx 0.707
     assert np.all(output == pytest.approx(0.707, abs=1e-3))
@@ -132,7 +132,7 @@ def test_refine_blur_softening():
     params = {"blur_px": 1.5}
     ctx = MockContext({})
 
-    output = refine_organic_signal(input_mask, params, ctx)
+    output = refine_signal(input_mask, params, ctx)
 
     # Center pixels (index 4 and 5) should no longer be 0.0 and 1.0
     assert 0.0 < output[5, 4] < 0.5
@@ -153,8 +153,8 @@ def test_interface_robustness():
         noise_amp=0.2, noise_id="test", max_opacity=0.8
     )
 
-    res_dict = refine_organic_signal(input_mask, dict_params, ctx)
-    res_obj = refine_organic_signal(input_mask, obj_params, ctx)
+    res_dict = refine_signal(input_mask, dict_params, ctx)
+    res_obj = refine_signal(input_mask, obj_params, ctx)
 
     assert np.array_equal(res_dict, res_obj)
 
@@ -165,4 +165,4 @@ def test_refine_error_on_missing_noise():
     ctx = MockContext({}) # Empty context
 
     with pytest.raises(KeyError, match="Unknown noise_id 'missing_ghost'"):
-        refine_organic_signal(input_mask, params, ctx)
+        refine_signal(input_mask, params, ctx)

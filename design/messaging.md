@@ -452,7 +452,7 @@ This design provides several advantages:
 {
   "msg": "error",
   "request_id": 12,
-  "message": "Render failed"
+  "message": "render failed"
 }
 ```
 

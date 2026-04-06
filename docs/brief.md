@@ -38,7 +38,7 @@ designed to bridge the gap between heavy GIS data and real-time artistic iterati
 
 The system is driven by a user configured compositing sequence:
 
-* **Dynamic Data Drivers:** Ingest any raster data (DEM, Precipitation, Forest Height, Lithology) and
+* **Dynamic Data Sources:** Ingest any raster data (DEM, Precipitation, Forest Height, Lithology) and
   define custom transformation policies.
 * **Logical Blending:** A library of atomic operations including `lerp_surfaces`, `alpha_over`, and
   `lerp_buffers` for sophisticated transitions.
@@ -47,7 +47,7 @@ The system is driven by a user configured compositing sequence:
 
 ### 2. Factor Library
 
-Factors act as the control signals for the entire render, conditioned from physical drivers into 0..1 masks:
+Factors act as the control signals for the entire render, conditioned from physical sources into 0..1 masks:
 
 * **Apparent Elevation Logic:** Procedural displacement of elevation and moisture inputs to create natural,
   wandering biome contacts and eliminate artificial "bathtub rings."
@@ -86,35 +86,35 @@ The engine features a highly configurable noise library for creating unique orga
 pipeline:
   - desc: Mix ARID_BASE and ARID_RED_BASE using lithology data
     enabled: true
-    comp_op: lerp_surfaces
-    factor_nm: lith
+    blend_op: lerp_surfaces
+    factor: lith
     input_surfaces: [ arid_base, arid_red_base ]
     output_surface: arid_composite
 
   - desc: Create the Canvas buffer with the ARID_COMPOSITE surface
     enabled: true
-    comp_op: create_buffer
+    blend_op: create_buffer
     input_surfaces: [ arid_composite ]
 
   - desc: Diagnostic Blackboard
     enabled: false
-    comp_op: create_buffer
+    blend_op: create_buffer
     buffer: canvas
     params:
       color: [ 214, 212, 195 ]
 
   - desc: Add ARID_VEGETATION to the arid region using the forest mask
     enabled: true
-    comp_op: lerp
-    factor_nm: forest
+    blend_op: lerp
+    factor: forest
     input_surfaces: [ arid_vegetation ]
     scale: 1.1
     contrast: 0.0
 
   - desc: Mix HUMID_BASE and ARID_RED_BASE using lithology data
     enabled: true
-    comp_op: lerp_surfaces
-    factor_nm: lith
+    blend_op: lerp_surfaces
+    factor: lith
     scale: 1.0
     input_surfaces: [ humid_base, arid_red_base ]
     output_surface: humid_composite
@@ -129,7 +129,7 @@ Process Topology:
 
 Core Model:
 Rendering is tile-based and highly parallel. Each tile may depend on
-multiple input driver blocks, and a tile cannot be rendered until all of
+multiple input source blocks, and a tile cannot be rendered until all of
 its required inputs have been loaded. Because tiles are independent once
 their inputs are ready, they may be rendered and written in any order.
 
@@ -210,5 +210,4 @@ THere is a detailed design spec for this.
   unlinking `.tmp` files. Add States in pipeline.
 * **Phase 3 (Watchdog):** Deadlock detection with tiered timeouts (Worker 7s / Orchestrator 10s).
 * **Phase 4 (Active Poisoning):** Sequential Shutdown via "Poison Pills" and SHM unlinking.
-
 

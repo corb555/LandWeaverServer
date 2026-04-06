@@ -3,7 +3,7 @@
 This project is a high-performance spatial compositing engine for generating natural-looking raster imagery from GIS
 data.
 It combines procedural noise, multi-scale Gaussian filtering, and explicit configuration-driven pipelines to synthesize
-visually rich terrain and land-cover surfaces. A configurable blend pipeline defines how driver rasters are loaded,
+visually rich terrain and land-cover surfaces. A configurable blend pipeline defines how  rasters are loaded,
 transformed, and composited into the final image.
 
 ## Design
@@ -35,9 +35,9 @@ head, so those cached blocks are evicted before they are reached again.
 **Cache ID**
 
 The pipeline operates on distinct regional file sets, such as Sedona, Yosemite, or Yellowstone. For each region, it
-typically reads a group of driver files with identical extent, resolution, and tile layout. Cache contents are valid
+typically reads a group of source files with identical extent, resolution, and tile layout. Cache contents are valid
 only within the context of a single region and must be invalidated when the active region changes. For repeated runs
-within the same region, the cache remains valid. The cache id will be a hash of sorted driver paths.
+within the same region, the cache remains valid. The cache id will be a hash of sorted source paths.
 
 **Block ID**
 

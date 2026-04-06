@@ -1,0 +1,472 @@
+# config_type:  biome.yml
+
+version: 1
+seed: 12345
+anchor: dem
+debug_factors: "true"
+
+files:
+  theme_qml: EVT_theme.qml
+  ramps_yml: biome_ramps.yml
+  humid_vegetation: humid_vegetation_color_ramp.txt
+
+sources:
+  dem: _DEM.tif
+  water_proximity: _water_proximity.tif
+  precip: _precip.tif
+  slope: _slope.tif
+  forest: _forest.tif
+  lith: _lith.tif
+  hillshade: _hillshade.tif
+  theme: _EVT_themed.tif
+
+surfaces:
+  snow:
+    source: dem
+    input_factor: elev_m
+    surface_builder: ramp
+    desc: >
+      High-altitude snow  color ramp.
+
+  arid_base:
+    source: dem
+    input_factor: elev_m
+    surface_builder: ramp
+    modifiers:
+      - effect: color_mottle
+        mod_profile: arid_mod
+    desc: >
+      Standard dry-climate soil and rock color ramp.
+
+  arid_red_base:
+    source: dem
+    input_factor: elev_m
+    surface_builder: ramp
+    modifiers:
+      - effect: color_mottle
+        mod_profile: lith_mod
+    desc: >
+      Iron-oxide rich (red rock) variant of the arid soil ramp.
+
+  arid_vegetation:
+    source: dem
+    input_factor: elev_m
+    surface_builder: ramp
+    modifiers:
+      - effect: color_mottle
+        mod_profile: arid_vegetation_mod
+    desc: >
+      Dry-climate vegetation colors (sagebrush, scrub, dormant grasses).
+
+  humid_base:
+    source: dem
+    input_factor: elev_m
+    surface_builder: ramp
+    modifiers:
+      - effect: color_mottle
+        mod_profile: humid_vegetation_mod
+    desc: >
+      Moist-climate forest floor and damp earth color ramp.
+
+  humid_vegetation:
+    source: dem
+    input_factor: elev_m
+    surface_builder: ramp
+    modifiers:
+      - effect: color_mottle
+        mod_profile: forest_mod
+    desc: >
+      Lush, chlorophyll-rich vegetation colors (conifers, rainforest, meadows).
+
+  theme_overlay:
+    source: theme
+    surface_builder: theme
+    files: [theme_qml]
+    desc: >
+      Categorical colors for specific features (water, rock, glacier) 
+      defined in QML.
+
+modifier_profiles:
+  arid_mod:
+    intensity: 20.0
+    shift_vector: [1.0, 0.8, 0.5]
+    noise_id: biome
+    desc: >
+      Warm sandstone and tan staining for arid soil and desert regions.
+
+  forest_mod:
+    intensity: 20.0
+    shift_vector: [0.1, 1.0, 0.2]
+    noise_id: forest
+    desc: >
+      High-contrast canopy variation with vibrant green peaks 
+      and deep neutral shadows.
+
+  humid_vegetation_mod:
+    intensity: 20.0
+    shift_vector: [0.8, 1.0, 0.5]
+    noise_id: forest
+    desc: >
+      Chlorophyll-focused variation for lush, moisture-rich vegetation layers.
+
+  arid_vegetation_mod:
+    intensity: 30.0
+    shift_vector: [1.0, 0.8, 0.2]
+    noise_id: biome
+    desc: >
+      Desaturated, earthy color shifts for dry-climate scrub, 
+      sagebrush, and dormant grass.
+
+  arid_base_mod:
+    intensity: 30.0
+    shift_vector: [1.0, 0.9, 0.7]
+    noise_id: biome
+    desc: >
+      Subtle mineral staining and variety for dry soil and 
+      base rock foundations.
+
+  lith_mod:
+    intensity: 35.0
+    shift_vector: [1.0, 0.5, 0.2]
+    noise_id: geology
+    desc: >
+
+factors:
+  theme_composite:
+    factor_builder: theme_composite
+    sources: [theme]
+    params:
+      water:
+        enabled: true
+        smoothing_radius: 0.0
+        blur_px: 0.0
+        noise_amp: 0.2
+        contrast: 1.0
+        max_opacity: 1.0
+        noise_id: fine_mottle
+        surface_intensity: 30.0
+        surface_shift_vector: [0.3, 0.3, 0.4]
+        surface_noise_id: forest
+
+      rock:
+        enabled: true
+        smoothing_radius: 0.3
+        blur_px: 3.0
+        noise_amp: 0.4
+        contrast: 0.8
+        max_opacity: 1.0
+        noise_id: forest
+        surface_noise_id: fine_mottle
+        surface_intensity: 45.0
+        surface_shift_vector: [1.0, 0.4, 0.2]
+
+      volcanic:
+        enabled: true
+        smoothing_radius: 0.2
+        noise_amp: 0.8
+        contrast: 1.0
+        max_opacity: 0.9
+        noise_id: fine_mottle
+        surface_intensity: 10.0
+        surface_shift_vector: [1.0, 0.4, 0.2]
+        surface_noise_id: biome
+
+      playa:
+        enabled: true
+        smoothing_radius: 0.3
+        blur_px: 15.0
+        noise_amp: 1.0
+        contrast: 1.7
+        max_opacity: 0.1
+        noise_id: geology
+        surface_intensity: 30.0
+        surface_shift_vector: [1.0, 0.9, 0.7]
+        surface_noise_id: biome
+
+      glacier:
+        enabled: true
+        smoothing_radius: 0.2
+        noise_amp: 0.6
+        contrast: 1.0
+        max_opacity: 1.0
+        blur_px: 1.0
+        noise_id: forest
+        surface_intensity: 30.0      # Reveal the "Deep Blue" crevasses
+        surface_shift_vector: [-1.0, -1.0, 0] # High contrast blue/white
+        surface_noise_id: fine_mottle
+
+  water:
+    factor_builder: categorical_mask
+    sources: [theme]
+    params:
+      label: "water"
+    desc: Binary mask for water bodies.
+
+  water_depth:
+    factor_builder: proximity_power
+    sources: [water_proximity]
+    params:
+      max_range_px: 300.0
+      sensitivity: 2.5
+    desc: Distance-based gradient for bathymetric darkening.
+
+  elev:
+    factor_builder: mapped_signal
+    sources: [dem]
+    noise_id: biome
+    params:
+      start: 0
+      full: 4000
+      noise_amp: 0.1
+      contrast: 1.0
+      max_opacity: 1.0
+    desc: Normalized 0..1 elevation.
+
+  elev_m:
+    factor_builder: raw_source
+    sources: [dem]
+    desc: Elevation in meters
+
+  precip:
+    factor_builder: mapped_signal
+    sources: [precip]
+    noise_id: biome
+    params:
+      start: 200
+      full: 500
+      noise_amp: 0.3
+      noise_atten_power: 1.2
+      contrast: 2.5
+    desc: Environmental gradient mask (Arid vs Humid).
+
+  forest:
+    factor_builder: mapped_signal
+    sources: [forest]
+    noise_id: forest
+    params:
+      start: 0
+      full: 40
+      noise_amp: 0.65
+      noise_atten_power: 0.5
+      contrast: 1.0
+      sensitivity: 1.6
+      max_opacity: 1.0
+      blur_px: 8.0
+    desc: Biological mask defining vegetation density.
+
+  lith:
+    factor_builder: mapped_signal
+    sources: [lith]
+    noise_id: forest
+    params:
+      band: 1
+      start: 0
+      full: 100
+      noise_amp: 1.0
+      max_opacity: 0.6
+      contrast: 1.0
+      blur_px: 40.0
+    desc: Organic transition mask for red-rock lithology regions.
+
+  snow_mask:
+    factor_builder: constrained_signal
+    sources: [dem, slope]
+    params:
+      threshold: 2800
+      ramp: 250
+      jitter_amt: 150
+      noise_id: forest
+      constraint_limit: 38
+      constraint_fade: 15
+      constraint_blur: 4
+    desc: Apparent elevation mask with cliff stripping.
+
+  hillshade:
+    factor_builder: protected_shaping
+    sources: [hillshade]
+    params:
+      input_scale: 255.0
+      gamma: 1.2
+      strength: 0.85
+      low_start: 0.0
+      low_end: 0.2
+      protect_lows: 0.001   # Shadows never go below x% brightness
+      high_start: 0.85
+      high_end: 1.0
+      protect_highs: 0.001  # Highlights never blow out to pure white
+
+pipeline:
+  - desc: Mix ARID_BASE and ARID_RED_BASE using lithology data
+    enabled: true
+    blend_op: lerp_surfaces
+    factor: lith
+    input_surfaces: [arid_base, arid_red_base]
+    output_surface: arid_composite
+
+  - desc: Create Canvas with the ARID_COMPOSITE surface
+    enabled: true
+    blend_op: create_buffer
+    input_surfaces: [arid_composite]
+
+  - desc: Create Canvas with Diagnostic Blackboard
+    enabled: false
+    blend_op: create_buffer
+    buffer: canvas
+    params:
+      color: [255, 255, 255]
+
+  - desc: Output the canvas buffer
+    enabled: false
+    blend_op: output_buffer
+    buffer: canvas
+
+  - desc: Add ARID_VEGETATION to the arid region using the forest mask
+    enabled: true
+    blend_op: lerp
+    factor: forest
+    input_surfaces: [arid_vegetation]
+    scale: 1.1
+    contrast: 0.0
+
+  - desc: Mix HUMID_BASE and ARID_RED_BASE using lithology data
+    enabled: true
+    blend_op: lerp_surfaces
+    factor: lith
+    scale: 1.0
+    input_surfaces: [humid_base, arid_red_base]
+    output_surface: humid_composite
+
+  - desc: Create the humid buffer with HUMID_COMPOSITE
+    enabled: true
+    blend_op: create_buffer
+    input_surfaces: [humid_composite]
+    buffer: humid
+
+  - desc: Add humid vegetation to the humid buffer using the forest mask
+    enabled: true
+    blend_op: lerp
+    factor: forest
+    scale: 1.1
+    contrast: 0.0
+    input_surfaces: [humid_vegetation]
+    buffer: humid
+
+  - desc: Merge the Canvas (Arid) and Humid buffers using moisture gradient
+    enabled: true
+    blend_op: lerp_buffers
+    factor: precip
+    merge_buffer: humid
+    bias: -0.30
+
+  - desc: Add THEME classes (water, rock, ice)
+    enabled: true
+    blend_op: alpha_over
+    factor: theme_composite
+    input_surfaces: [theme_overlay]
+
+  - desc: Simulate bathymetric darkening in lakes and rivers
+    enabled: false
+    blend_op: apply_zonal_gradient
+    factor: water_depth
+    mask_nm: water
+    params:
+      color_0: [82, 90, 105]  # Shallow color
+      color_1: [58, 64, 74]  # Deep color
+
+  - desc: Mask in high-altitude snow based on jittered snowline
+    enabled: true
+    blend_op: lerp
+    factor: snow_mask
+    input_surfaces: [snow]
+
+  - desc: Add hillshades
+    enabled: true
+    blend_op: multiply
+    factor: hillshade
+    buffer: canvas
+
+  - desc: Output the canvas buffer
+    enabled: true
+    blend_op: output_buffer
+    buffer: canvas
+
+source_specs:
+  dem:
+    dtype: float32
+
+  precip:
+    dtype: float32
+
+  slope:
+    dtype: float32
+
+  lith:
+    dtype: float32
+    cleanup_type: continuous
+    smoothing_radius: 8.0
+
+  hillshade:
+    dtype: float32
+
+  forest:
+    dtype: float32
+    cleanup_type: continuous
+    smoothing_radius: 8.0
+
+  water_proximity:
+    dtype: float32
+    cleanup_type: continuous
+    smoothing_radius: 15.0
+
+  theme:
+    dtype: uint8
+    cleanup_type: categorical
+
+output:
+  creation_options:
+    COMPRESS: "DEFLATE"
+    TILED: "YES"
+    BLOCKXSIZE: 256
+    BLOCKYSIZE: 256
+
+noise_profiles:
+  biome:
+    sigmas: [8.0, 25.0, 60.0]
+    weights: [0.5, 0.3, 0.2]
+    desc: >
+      Large organic masses
+
+  geology:
+    sigmas: [3.0, 31.0, 199.0]
+    weights: [0.7, 0.0, 0.3]
+    stretch: [1.0, 1.0]
+    desc: >
+      Continents with rugged edges
+
+  water:
+    sigmas: [0.8, 1.5, 3.0]
+    weights: [0.6, 0.3, 0.1]
+    stretch: [1.0, 4.0]
+    seed_offset: 1
+    desc: >
+      Directional ripples / Flow
+
+  fine_mottle:
+    sigmas: [1.0, 2.0]
+    weights: [0.8, 0.2]
+    desc: >
+      Sandpaper / Surface Grit
+
+  forest:
+    sigmas: [0.8, 3.5, 12.0]
+    weights: [0.3, 0.5, 0.2]
+    stretch: [1.0, 1.0]
+    desc: >
+      Clumpy / Circular patches
+
+  drifts:
+    sigmas: [40.0, 150.0, 400.0]
+    weights: [0.5, 0.3, 0.2]
+    desc: >
+      Very soft, hazy clouds
+

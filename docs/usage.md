@@ -3,9 +3,13 @@
 
 ## Overview
 
-Thematic Rendering is a GIS-based rendering system for turning georeferenced raster inputs into a polished map surface.
+Thematic Rendering is a GIS-based rendering system for turning georeferenced raster inputs into a 
+polished map surface.
 
-Instead of styling one raster at a time, the system combines multiple GIS layers—such as elevation, slope, precipitation, forest cover, lithology, water proximity, and categorical land-cover rasters—into a staged rendering workflow. This makes it possible to build outputs that look more like a finished terrain or landscape rendering than a standard raster style.
+The system combines multiple GIS layers—such as elevation, 
+slope, precipitation, forest cover, lithology, water proximity, and categorical land-cover rasters—into
+a staged rendering workflow. This makes it possible to build complex outputs that look more like a finished 
+terrain or landscape rendering than a simple raster.
 
 Typical uses include:
 
@@ -13,57 +17,58 @@ Typical uses include:
 - displaying categories from products such as USGS Landfire
 - softening hard raster boundaries into more natural transitions
 - applying hillshade, texture, and zonal effects
-- previewing and tuning a render design quickly
 
 ## High-level workflow
 
 At a high level, a render works like this:
 
-1. **Files** define the input georeferenced rasters and supporting resources.
-2. **Functions** turn those source rasters into reusable **factors**.
-3. **Surfaces** define color layers or material layers that can be drawn into the render.
-4. The **pipeline** defines an ordered sequence of **compositing operations** that combine surfaces and factors into the final output.
+1.  **Sources**: The physical input georeferenced rasters (DEM, Slope, Land Cover).
+2.  **Factors**: A Factor is a normalized control layer, usually in the range `0.0` to `1.0`, that tells the renderer where and 
+how strongly an effect should be applied. Factors are created by applying mathematical Functions to raw sources. For example, a Digital Elevation raster with values from `100m` to `4000m` can be transformed into a smooth `0–1` signal representing altitude.
+3.  **Surfaces**: A surface is a render-ready visual layer, such as terrain color, vegetation color, snow, or rock overlay. A surface 
+is a render-ready visual layer created from a raster source, usually using a color ramp, theme styling, or texture modifiers.
+4.  **Blend Operations**: These are the operations that combine Surfaces and Factors. For example, a `light_green_meadow` 
+surface and a `dark_green_forest` surface are blended using a `tree_canopy` factor, where 1.0 draws the forest and 0.0 draws the meadow.
+5.  **Pipeline**: Defines the ordered sequence of execution. It dictates how the system layers these operations one after another to 
+build the final  image.
+
 
 ```mermaid
 flowchart LR
-    Files[Files]
+    Sources[Sources]
     Functions[Functions]
     Factors[Factors]
     Surfaces[Surfaces]
-    CompOps[Comp Ops]
-    Output[Final Output]
+    BlendOps[Blend Ops]
+    Output[Output]
 
-    Files --> Functions
+    Sources --> Functions
     Functions --> Factors
 
-    Files --> Surfaces
+    Sources --> Surfaces
 
-    Factors --> CompOps
-    Surfaces --> CompOps
+    Factors --> BlendOps
+    Surfaces --> BlendOps
 
-    CompOps --> Output
+    BlendOps --> Output
 ```
 
 
 ## Core rendering components
 
-### Files
+### Sources
 
-**Files** are the source datasets and supporting resources used by the render.
+**Sources** are the source georeferenced datasets used by the render.
 
 These usually include georeferenced raster inputs such as:
 
 * DEM
 * slope
 * precipitation
-* forest or canopy
+* forest canopy
 * lithology
 * water proximity
-* categorical theme rasters
-
-They can also include supporting resources such as color ramps or QML theme definitions.
-
-Files are the raw ingredients the render starts with.
+* categorical theme raster
 
 ---
 
@@ -71,22 +76,24 @@ Files are the raw ingredients the render starts with.
 
 A **surface** is a render-ready visual layer.
 
-A surface usually starts from one source raster and converts it into a color or material layer that can be blended into the render. It may also include modifiers such as mottling or texture.
+A surface usually starts from one source raster and converts it into a color or material layer that can 
+be blended into the render. It may  include modifiers such as mottling or texture.
 
 A surface is not the source raster itself. It is the visual layer generated from that raster.
 
 Examples:
 
-* arid soil surface
-* humid vegetation surface
+* forest surface - a surface created from a color ramp file
 * snow surface
-* thematic overlay surface
+* thematic overlay surface - a surface created from a category/theme file
 
 ---
 
 ### Factor
 
-**Factors**  control where and how strongly a surface should appear. A factor is often a grayscale-like signal in the range `0–1`, although some factors may carry raw physical values such as elevation in meters.
+**Factors**  control where and how strongly a surface should appear. A factor is often a grayscale-like
+signal in the range `0–1`, although some factors may carry raw physical values such as elevation in 
+meters.
 
 Typical factor roles include:
 
@@ -99,11 +106,12 @@ Typical factor roles include:
 Examples:
 
 * moisture
-* forest density
+* tree canopy
 * snow mask
 * elevation
 
-A factor does not usually provide color by itself. Instead, it controls blending, masking, opacity, or other render decisions.
+A factor does not normally provide color by itself. Instead, it controls blending, masking, opacity, or 
+other render actions.
 
 ---
 
@@ -111,7 +119,8 @@ A factor does not usually provide color by itself. Instead, it controls blending
 
 A **function** is the logic used to create a factor.
 
-Functions take source rasters and supporting data and turn them into usable render signals. For example, a function may:
+Functions take source rasters and supporting data and turn them into usable render signals. For example, 
+a function may:
 
 * pass through an unmodified raster
 * convert a continuous raster into a `0–1` mask
@@ -121,15 +130,13 @@ Functions take source rasters and supporting data and turn them into usable rend
 
 ---
 
-### Comp op
+### Blend op
 
-A **comp op** (compositing operation) is a render step that combines layers.
+A **blend op** (blend operation) is a render step that combines layers typically using factors.
 
-Comp ops define what to do with surfaces, factors, and buffers, such as:
+Blend ops define what to do with surfaces, factors, and buffers, such as:
 
-* create a new buffer
 * blend one surface into another
-* merge two buffers
 * multiply by a shading layer
 * alpha-composite a thematic overlay
 * write the final output
@@ -140,9 +147,10 @@ Comp ops define what to do with surfaces, factors, and buffers, such as:
 
 The **pipeline** is the ordered list of rendering steps and their parameters.
 
-This is the part of the config that says, step by step, how to build the final image. Each pipeline item usually references:
+This is the part of the config that says, step by step, how to build the final image. Each pipeline 
+item usually references:
 
-* a **comp op**
+* a **blend op**
 * one or more **surfaces**
 * a controlling **factor**
 * sometimes a target **buffer**
@@ -154,7 +162,7 @@ Because the pipeline is ordered, each step builds on the previous ones.
 
 ### Theme
 
-A **theme** is a categorical raster in which each class is represented by a distinct pixel value.
+A **theme** is a special raster in which each class is represented by a distinct pixel value.
 
 For example, a theme raster might encode:
 
@@ -163,6 +171,8 @@ For example, a theme raster might encode:
 * playa = 3
 
 Any pixel with value `2` would be interpreted as volcanic.
+The theme source must be an 8-bit Unsigned (uint8) categorical raster. Valid category IDs range from 1–255. The value 0 is reserved 
+as NoData (Background), which the renderer will treat as fully transparent.
 
 Themes are mainly used for category-based masking and overlays.
 
@@ -172,25 +182,64 @@ Themes are mainly used for category-based masking and overlays.
 
 A **buffer** is an intermediate working image used during rendering.
 
-Buffers store the results of compositing steps so they can be reused later in the pipeline. The default buffer is usually named `canvas`. Additional buffers can be created for more complex renders and later merged back into the main canvas.
-
-Buffers are the main working render targets inside the pipeline.
+Buffers store the results of blend steps so they can be reused later in the pipeline. The default buffer is  named `canvas`. 
+Additional buffers can be created for more complex renders and later merged into the `canvas` buffer.
 
 ---
 
-### Noise
+Since the user interacts primarily through a GUI Editor, the documentation should focus on the **Panels** and **Settings** they see on their screen. This frames noise as a tool for "Naturalization" that they can dial in using specific controls.
 
-The engine includes a configurable **noise library** for generating organic variation and texture.
+Here is the refined guide for the **Procedural Noise** system.
 
-Noise can be used to:
+---
 
-* soften hard raster boundaries
-* add natural-looking mottling
-* create stretched directional textures
-* vary snowlines, vegetation edges, or terrain transitions
-* introduce surface texture without changing the source GIS data
+### Procedural Noise
 
-Noise profiles are typically built from multiple spatial scales, so they can combine fine detail with broad organic structure.
+The system includes a high-performance noise library used to transform rigid, "pixelated" GIS data into organic landscapes. 
+Noise is pre-computed to ensure perfectly seamless tiling and instantaneous rendering updates when settings are changed.
+
+Noise is applied in three distinct roles:
+
+#### 1. Organic Wandering (The "Wiggle")
+Noise can be used to "perturb" a geographic boundary so it doesn't follow a sterile elevation line.
+*   **Where to find it:** In the **Factors** section settings.
+*   **How it works:** By adjusting the `Jitter` and `Noise ID` settings, the noise physically pushes the boundary (like a snowline 
+or treeline) up or down.
+*   **The Result:** Snow will "dip" into cold valleys and "recede" on sun-exposed ridges naturally, mimicking local micro-climates.
+
+#### 2. Clumping & Transparency (The "Patchiness")
+Noise can modulate the density of a layer to create varied, non-uniform distributions.
+*   **Where to find it:** In the **Theme** or **Factors** section under `Noise Amplitude`.
+*   **How it works:** The noise acts as a visibility mask. At high amplitude, it creates "holes" or gaps in the layer.
+*   **The Result:** A forest canopy will look like a collection of individual tree clumps rather than a solid green block; sand 
+areas will look "wispy" and thin at the edges.
+
+#### 3. Surface Grit (Mottling)
+Noise can be injected directly into the color of a surface to add tactile "tooth" and geological variety.
+*   **Where to find it:** In the **Surface Modifiers** section, which is then assigned to a **Surface**.
+*   **How it works:** The noise field "shifts" the RGB values of a color ramp slightly.
+*   **The Result:** Large areas of flat color are broken up with "mottle," simulating mineral staining, soil variety, or rock grit 
+without changing the underlying geographic data.
+
+---
+
+### Noise Profiles
+Profiles are defined in the **Noise** section. Each profile is built from multiple **Sigmas** (spatial scales) which control 
+the "frequency" of the noise:
+
+*   **Large Sigmas (e.g., 200):** Create broad, sweeping organic masses. Use these for wandering boundaries that span miles.
+*   **Small Sigmas (e.g., 2):** Create fine-grained "grit" or "fuzz." Use these for adding tactile detail to rock or soil.
+*   **Anisotropic Stretch:** Settings that allow you to stretch noise in a specific direction (e.g., 4:1). This is used to 
+simulate patterns like flowing water, wind-swept sand, or sedimentary rock layers.
+
+---
+
+### Noise Use
+| Section               | How Noise is Used           | Purpose                              |
+|:----------------------|:----------------------------|:-------------------------------------|
+| **Factors**           | Jitter / Apparent Elevation | Makes boundaries wander naturally.   |
+| **Themes**            | Noise Amplitude             | Creates clumping and wispy edges.    |
+| **Surface Modifiers** | Mottling Intensity          | Adds color variety and surface grit. |
 
 # DETAILS
 
@@ -199,32 +248,15 @@ Noise profiles are typically built from multiple spatial scales, so they can com
 **Factors** convert source rasters and supporting data into reusable **render signals**.
 
 A **factor** is usually a 2D numeric layer used to control color blending, masking, opacity, shading, texture, or 
-category-based effects. A factor is not usually the final image by itself. Instead, it acts like a control surface that tells the rendering 
-pipeline **where** and **how strongly** to apply an effect.
+category-based effects. A factor is not usually the final image by itself. Instead, it acts like a control surface that tells
+the rendering pipeline **where** and **how strongly** to apply an effect.
 
 Some factors preserve raw values exactly, while others convert a raster into a normalized 0–1 mask, a distance-based gradient, 
 a thematic class mask, or a more natural-looking terrain boundary.
 
-## Factor functions at a glance
+## Factor Builders 
 
-| Function ID           | Purpose                                                                          | Typical GIS use                                                                    |
-|-----------------------|----------------------------------------------------------------------------------|------------------------------------------------------------------------------------|
-| `raw_driver`          | Passes a source raster through unchanged                                         | Raw elevation in meters, raw slope, raw theme IDs.                                 |
-| `mapped_signal`       | Converts a continuous raster into a smooth 0–1 influence mask.                   | Moisture gradients, vegetation density, lithology influence, normalized elevation. |
-| `theme_composite`     | Combines multiple thematic classes into one composite alpha mask.                | Water + rock + glacier overlays from a category raster.                            |
-| `protected_shaping`   | Converts a grayscale raster into a safer brightness-modulation                   | Hillshade or texture modulation without crushing map colors.                       |
-|                       | factor that protects shadows and highlights.                                     |                                                                                    |
-| `specular_highlights` | Creates small bright glints from noise, optionally limited by a mask.            | Sparkle on water, glacier, or wet surfaces.                                        |
-| `noise_overlay`       | Creates a texture-like multiply factor from a noise profile.                     | Surface mottling, mineral texture, canopy variation, water variation.              |
-| `proximity_power`     | Converts a proximity or distance raster into a smooth distance-based gradient.   | Bathymetric darkening, shoreline fades, interior distance effects.                 |
-| `categorical_mask`    | Creates a binary mask for one named category in a thematic raster.               | Water mask, glacier mask, volcanic mask, playa mask.                               |
-| `edge_fade`           | Creates a soft transition within a named category using proximity.               | Shoreline fade, tree-line thinning, marsh or playa margins.                        |
-| `constrained_signal`  | Builds a natural-looking boundary using a primary signal,                        | Snowlines, tree-lines, alpine bands, terrain-limited vegetation zones.             |
-|                       | optional noise jitter, and a physical constraint.                                |                                                                                    |
-| `expression`          | Evaluates a validated custom math expression using declared drivers and factors. | Custom raster logic, one-off masks, terrain rules, prototype factors.              |
-
-
-## raw_driver
+## raw_source
 Prepares a source raster without change for pipeline use.  Note, you cannot directly use a source raster without going through at
 at least one factor.
 
@@ -252,9 +284,9 @@ In most cases, this is the factor to use when you want a raster to act like a sm
 ```yaml
 factors:
   precip:
-    function_id: mapped_signal
-    drivers: [precip]
-    required_noise: biome
+    factor_builder: mapped_signal
+    sources: [precip]
+    noise_id: biome
     params:
       start: 200
       full: 500
@@ -267,7 +299,7 @@ factors:
 
 Use `mapped_signal` when you want a raster to become a **soft blend mask** or **continuous influence surface**.
 
-Use `raw_driver` instead when you need the original values unchanged.
+Use `raw_source` instead when you need the original values unchanged.
 
 
 ## theme_composite
@@ -297,8 +329,8 @@ Typical uses include:
 ```yaml
 factors:
   theme_overlay_alpha:
-    function_id: theme_composite
-    drivers: [theme]
+    factor_builder: theme_composite
+    sources: [theme]
     params:
       water:
         enabled: true
@@ -348,8 +380,8 @@ Typical uses include:
 ```yaml
 factors:
   hillshade_safe:
-    function_id: protected_shaping
-    drivers: [hillshade]
+    factor_builder: protected_shaping
+    sources: [hillshade]
     params:
       input_scale: 255.0
       gamma: 1.25
@@ -365,8 +397,6 @@ factors:
 ### When to use it
 
 Use `protected_shaping` when a raster will be used as a **brightness modifier** and you want a more cartographic result than a raw multiply.
-
-
 
 
 ## specular_highlights
@@ -396,8 +426,8 @@ Typical uses include:
 ```yaml
 factors:
   water_glints:
-    function_id: specular_highlights
-    required_noise: water
+    factor_builder: specular_highlights
+    noise_id: water
     required_factors: [water_mask]
     params:
       scale: 6.0
@@ -417,7 +447,7 @@ Use `noise_overlay` when you want **broad texture modulation** instead.
 Creates a multiply-ready texture factor from a named noise profile, optionally limited by a mask.
 
 This function produces controlled fine or medium-scale variation that can be used to break up flat areas, add mottling, or create a more natural-looking surface. The result is centered 
-around **1.0**, which makes it suitable for multiply-style compositing. 
+around **1.0**, which makes it suitable for multiply-style blend. 
 
 ### What it is good for
 
@@ -440,8 +470,8 @@ Typical uses include:
 ```yaml
 factors:
   rock_texture:
-    function_id: noise_overlay
-    required_noise: fine_mottle
+    factor_builder: noise_overlay
+    noise_id: fine_mottle
     required_factors: [rock_mask]
     params:
       scale: 3.0
@@ -482,8 +512,8 @@ Typical uses include:
 ```yaml
 factors:
   water_depth:
-    function_id: proximity_power
-    drivers: [water_proximity]
+    factor_builder: proximity_power
+    sources: [water_proximity]
     required_factors: [water_mask]
     params:
       max_range_px: 300.0
@@ -524,8 +554,8 @@ Typical uses include:
 ```yaml
 factors:
   water_mask:
-    function_id: categorical_mask
-    drivers: [theme]
+    factor_builder: categorical_mask
+    sources: [theme]
     params:
       label: water
 ```
@@ -565,8 +595,8 @@ Typical uses include:
 ```yaml
 factors:
   shoreline_fade:
-    function_id: edge_fade
-    drivers: [water_proximity]
+    factor_builder: edge_fade
+    sources: [water_proximity]
     params:
       label: water
       ramp_width: 15.0
@@ -611,10 +641,10 @@ Typical uses include:
 
 ### How it works
 
-1. It starts with a **primary driver** such as elevation.
+1. It starts with a **primary source** such as elevation.
 2. It optionally adds **noise-based jitter** so the line does not follow a perfect contour.
 3. It converts that result into a smooth **0–1 transition zone**.
-4. It applies a **constraint driver** such as slope to reduce or remove the signal where terrain conditions are unsuitable.
+4. It applies a **constraint source** such as slope to reduce or remove the signal where terrain conditions are unsuitable.
 
 ### Examples
 
@@ -627,8 +657,8 @@ Typical uses include:
 ```yaml
 factors:
   snow_mask:
-    function_id: constrained_signal
-    drivers: [dem, slope]
+    factor_builder: constrained_signal
+    sources: [dem, slope]
     params:
       threshold: 3200
       ramp: 120
@@ -644,13 +674,13 @@ Use `constrained_signal` when a boundary should feel **geographically believable
 
 Use `mapped_signal` when you only need a straightforward continuous mask without this extra terrain logic.
 
-## expression
+## raster_calculator
 
-The `expression` factor allows you to write custom raster math directly in YAML using a restricted, validated math syntax. It is designed for advanced cases where you want a custom mask or influence surface without adding a new Python function. 
+The `raster_calculator`  allows you to write custom raster math directly using a restricted, validated math syntax. It is designed for advanced cases where you want a custom mask or influence surface without adding a new Python function. 
 
 ### What it is good for
 
-Use `expression` when you want to combine existing drivers and factors with custom logic such as:
+Use `raster_calculator` when you want to combine existing sources and factors with custom logic such as:
 
 - elevation-and-slope masks
 - moisture and canopy combinations
@@ -659,13 +689,13 @@ Use `expression` when you want to combine existing drivers and factors with cust
 
 ### Basic syntax
 
-Set `function_id` to `expression` and provide an expression string in `params.expr`.
+Set `factor_builder` to `raster_calculator` and provide an expression string in `params.expr`.
 
 ```yaml
 factors:
   alpine_mask:
-    function_id: expression
-    drivers: [dem]
+    factor_builder: raster_calculator
+    sources: [dem]
     params:
       expr: "clamp((dem - 2500) / 500, 0, 1)"
 ```
@@ -674,20 +704,20 @@ factors:
 
 Expressions can use:
 
-1. **Drivers** listed in `drivers: []`
+1. **Sources** listed in `sources: []`
 2. **Factors** listed in `required_factors: []`
 
-Any factor referenced here must be defined earlier in the YAML so it is available when the expression is evaluated.
+Any factor referenced here must be defined earlier in the configuration so it is available when the expression is evaluated.
 
 ```yaml
 factors:
   moisture:
-    function_id: mapped_signal
-    drivers: [precip]
+    factor_builder: mapped_signal
+    sources: [precip]
 
   lush_valley:
-    function_id: expression
-    drivers: [dem]
+    factor_builder: raster_calculator
+    sources: [dem]
     required_factors: [moisture]
     params:
       expr: "moisture * (1.0 - clamp(dem / 1000, 0, 1))"
@@ -720,8 +750,8 @@ factors:
 ```yaml
 factors:
   complex_snow:
-    function_id: expression
-    drivers: [dem, slope]
+    factor_builder: raster_calculator
+    sources: [dem, slope]
     required_factors: [jitter]
     params:
       expr: "smoothstep(3000, 3200, dem + jitter) * (1.0 - smoothstep(35, 45, slope))"
@@ -729,11 +759,11 @@ factors:
 
 ### When to use it
 
-Use `expression` when the built-in factors are close, but you need a **custom combination rule** for a specific render.
+Use `raster_calculator` when the built-in factors are close, but you need a **custom combination rule** for a specific render.
 
 Use a dedicated built-in factor when the logic already exists, because built-in factors are usually easier to read and document.
 
-## Composite Operations
+## Blend Operations
 
 ### create_buffer
 
@@ -743,7 +773,7 @@ named `canvas' although addtional buffers can be used for complex renderings.
 In addition, rather than use a surface, you can create directly create a single colored surface and add it to the buffer.
 ```  - desc: Diagnostic Blackboard
     enabled: false
-    comp_op: create_buffer
+    blend_op: create_buffer
     buffer: canvas
     params:
       color: [0, 0, 0]  
@@ -806,7 +836,7 @@ Typical uses include:
 
 ### alpha_over_op
 
-Draws one visual layer over another using alpha compositing.
+Draws one visual layer over another using alpha blend.
 
 Use this when you want an overlay to sit on top of the existing image, while respecting transparency. This is commonly used for thematic overlays and special feature layers.
 
@@ -846,7 +876,9 @@ Typical uses include:
 
 ## Surfaces
 
-### Ramps
+Surfaces are created using `surface_builders` as follows.
+
+### Ramp Surface Builder
 
 A **ramp surface** uses a continuous raster value—most often elevation—to sample a color ramp and create a render-ready visual layer.
 
@@ -859,7 +891,7 @@ Typical uses include:
 - dry-to-moist land color variation
 - broad terrain base layers
 
-### Theme
+### Theme Surface Builder
 
 A **theme surface** uses a categorical theme raster and its class styling to create a visual overlay.
 
@@ -868,3 +900,43 @@ Use theme surfaces when the appearance depends on named classes rather than cont
 Typical uses include:
 
 - land-cover or thematic category rendering such as USGS LANDFIRE
+
+# Reference Guide
+
+## Surface Builders 
+
+| Surface Builder   | Purpose                                                                                                              | Typical use |
+|-------------------|----------------------------------------------------------------------------------------------------------------------|---|
+| `ramp`            | Uses a continuous raster value, most often elevation, to sample a color ramp and create a render-ready visual layer. | Elevation-based terrain coloring, snow coloring by elevation, broad terrain base layers |
+| `theme`           | Uses a categorical theme raster and its class styling to create a visual overlay.                                    | Water, glacier, rock, volcanic, or playa overlays from a theme raster |
+
+## Factor Builders
+
+| Factor Builder        | Purpose                                                                          | Typical  use                                                                    |
+|-----------------------|----------------------------------------------------------------------------------|------------------------------------------------------------------------------------|
+| `raw_source`          | Passes a source raster through unchanged                                         | Raw elevation in meters, raw slope, raw theme IDs.                                 |
+| `mapped_signal`       | Translates a specific range of raw input values into the 0.0–1.0  range          | Moisture gradients, vegetation density, lithology influence, normalized elevation. |
+| `theme_composite`     | Combines multiple thematic classes into one composite alpha mask.                | Water + rock + glacier overlays from a category raster.                            |
+| `protected_shaping`   | Converts a grayscale raster into a safer brightness-modulation                   | Hillshade or texture modulation without crushing map colors.                       |
+|                       | factor that protects shadows and highlights.                                     |                                                                                    |
+| `specular_highlights` | Creates small bright glints from noise, optionally limited by a mask.            | Sparkle on water, glacier, or wet surfaces.                                        |
+| `noise_overlay`       | Creates a texture-like multiply factor from a noise profile.                     | Surface mottling, mineral texture, canopy variation, water variation.              |
+| `proximity_power`     | Converts a proximity or distance raster into a smooth distance-based gradient.   | Bathymetric darkening, shoreline fades, interior distance effects.                 |
+| `categorical_mask`    | Creates a binary mask for one named category in a thematic raster.               | Water mask, glacier mask, volcanic mask, playa mask.                               |
+| `edge_fade`           | Creates a soft transition within a named category using proximity.               | Shoreline fade, tree-line thinning, marsh or playa margins.                        |
+| `constrained_signal`  | Builds a natural-looking boundary using a primary signal,                        | Snowlines, tree-lines, alpine bands, terrain-limited vegetation zones.             |
+|                       | optional noise jitter, and a physical constraint.                                |                                                                                    |
+| `raster_calculator`   | Evaluates a validated custom math expression using declared sources and factors. | Custom raster logic, one-off masks, terrain rules, prototype factors.              |
+
+## Blend Operations 
+
+| Operation                 | Purpose                                                              | Typical use                                        |
+|---------------------------|----------------------------------------------------------------------|----------------------------------------------------|
+| `create_buffer`           | Create or initialize a working buffer from a surface or solid color. | Start the canvas or create a diagnostic background |
+| `lerp_surfaces`           | Blend two surfaces using a factor.                                   | Transition between two terrain styles              |
+| `lerp_surface_to_buffer`  | Blend one surface into an existing buffer using a factor.            | Add vegetation, snow, or a local treatment         |
+| `lerp_buffers`            | Blend one buffer into another using a factor.                        | Merge two intermediate render results              |
+| `multiply_op`             | Multiply a buffer by a modulation layer.                             | Hillshade, texture, darkening                      |
+| `alpha_over_op`           | Overlay one layer on top of another with transparency.               | Thematic overlays such as water, rock, glacier     |
+| `add_specular_highlights` | Add bright reflective glints.                                        | Water sparkle, wet highlights, icy shimmer         |
+| `apply_zonal_gradient`    | Apply internal color variation within a zone.                        | Lake depth effect, shoreline fade, wetland tinting |

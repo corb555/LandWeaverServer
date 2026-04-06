@@ -39,7 +39,7 @@ Process Topology:
 
 Core Model:
 Rendering is tile-based and highly parallel. Each tile may depend on
-multiple input driver blocks, and a tile cannot be rendered until all of
+multiple input source blocks, and a tile cannot be rendered until all of
 its required inputs have been loaded. Because tiles are independent once
 their inputs are ready, they may be rendered and written in any order.
 
