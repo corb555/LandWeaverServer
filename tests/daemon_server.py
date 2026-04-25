@@ -7,7 +7,7 @@ import socket
 import sys
 from typing import Any
 
-SOCKET_PATH = "thematic_render.sock"
+SOCKET_PATH = "land_weaver.sock"
 ENCODING = "utf-8"
 BACKLOG = 5
 BUFFER_SIZE = 4096

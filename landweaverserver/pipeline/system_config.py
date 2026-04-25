@@ -16,49 +16,39 @@ class SystemConfig:
     source_specs: Dict[SourceKey, SourceRndrSpec]
 
     @classmethod
-    def load_engine_specs(cls, engine_config_path: Path) -> "SystemConfig":
+    def load_engine_specs(cls, engine_config_path: Path, source_specs) -> "SystemConfig":
         """
         ROUTINE 0: Cold Boot Loader.
-        Parses engine.yml to define the physical capacity of the machine.
+        Parses settings yml to define the capacity of the machine.
         This is used to initialize EngineResources and SHM pools.
         """
         import yaml
+
         context = "[SystemConfig] Load engine specs"
         print(context)
-        with open(engine_config_path, 'r') as f:
+
+        with open(engine_config_path, "r") as f:
             defs = yaml.safe_load(f)
 
         system = defs.get("system")
         try:
-            # 1. Extract Hardware Capacity
-            # system = defs.get("system")
-            # This is the "Physical Pipe Diameter"
             system_max_halo = int(system.get("max_halo"))
 
-            # 2. Parse Source  Registry
-            # This defines the physical data types for SHM allocation
-            source_specs = {}
             dtype_map = {
-                "float32": np.float32, "uint8": np.uint8, "int16": np.int16, "float64": np.float64
+                "float32": np.float32, "uint8": np.uint8, "int16": np.int16, "float64": np.float64,
             }
 
-            for dname, data in defs.get("source_specs").items():
-                # Note: We use string keys or dynamic enums here
-                # to allow users to add new sources without code changes.
+            hw_source_specs = {}
+            for dname, data in source_specs.items():
                 dkey = to_enum_sys(SourceKey, dname)
 
-                source_specs[dkey] = SourceHWSpec(
-                    dtype=dtype_map.get(data["dtype"]),
-                    # All sources in SHM are allocated at the machine's max halo capacity
-                    halo_px=system_max_halo, )
+                hw_source_specs[dkey] = SourceHWSpec(
+                    dtype=dtype_map.get(data.dtype), halo_px=system_max_halo, )
 
-            # 3. Construct the "Machine" Config
-            return cls(
-                defs=defs, source_specs=source_specs
-            )
+            return cls(defs=defs, source_specs=hw_source_specs)
 
         except MemoryError as e:
-            print(f"❌ FATAL ENGINE BOOT ERROR: {context} -> {str(e)}")
+            print(f"❌ FATAL ENGINE START ERROR: {context} -> {str(e)}")
             raise SystemExit(1)
 
     def get(self, path: str, default: Any = None) -> Any:

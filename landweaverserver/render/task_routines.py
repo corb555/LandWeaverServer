@@ -4,11 +4,12 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 
-from landweaverserver.common.ipc_packets import RenderPacket, WriterPacket, BlockReadPacket, WindowRect
+from landweaverserver.common.ipc_packets import RenderPacket, WriterPacket, BlockReadPacket, \
+    WindowRect
 from landweaverserver.pipeline.worker_contexts import WorkerContext, WriterContext
 from landweaverserver.render.compositing_engine import CompositingEngine
 from landweaverserver.render.factor_engine import FactorEngine
-from landweaverserver.render.noise_library import NoiseLibrary
+from landweaverserver.render.noise_engine import NoiseEngine
 from landweaverserver.render.surface_engine import SurfaceEngine
 
 
@@ -51,42 +52,29 @@ def write_task(*, packet: WriterPacket, ctx: WriterContext, out_pool) -> None:
 
 def render_task(*, packet, ctx, workspace, out_pool, pool_map):
     # EXTRACT DATA from SHM and set up the spatial compute window
-    data_2d, masks_2d, compute_window, h, w = _prepare_compute_context(packet, ctx, pool_map)
+    data_2d, masks_2d, window, h, w = _prepare_compute_context(packet, ctx, pool_map)
 
-    # CLEAN raster data through smoothing
-    """for drv_key in data_2d.keys():
-        drv_spec = ctx.render_cfg.get_spec(drv_key)
-        if not drv_spec.cleanup_type:
-            continue
-
-        if drv_spec.cleanup_type == "continuous":
-            smoothing_radius = drv_spec.smoothing_radius
-            if smoothing_radius and smoothing_radius > 0:
-                data_2d[drv_key] = gaussian_filter(
-                    data_2d[drv_key].astype(np.float32), sigma=smoothing_radius
-                )"""
-
-    # GENERATE FACTORS (masks representing biomes, density, or gradients)
+    # GENERATE FACTORS
     raw_factors = workspace.factor_eng.generate_factors(
-        data_2d, masks_2d, compute_window, ctx.anchor_key
+        data_2d, masks_2d, window, ctx.anchor_key
     )
     factors_2d = {k: np.squeeze(f) for k, f in raw_factors.items()}
 
-    # SYNTHESIZE SURFACES and apply procedural variation (mottling)
-    surface_blocks = workspace.surface_eng.generate_surface_blocks(
+    # GENERATE SURFACES
+    surface_blocks = workspace.surface_eng.generate_surfaces(
         data_2d=data_2d, masks_2d=masks_2d, factors_2d=factors_2d, style_engine=ctx.themes,
         surface_inputs=ctx.surface_inputs, noises=workspace.factor_eng.noise_registry,
-        window=compute_window, anchor_key=ctx.anchor_key
+        window=window, anchor_key=ctx.anchor_key
     )
 
-    # CROP RESULTS to target size
+    # CROP RESULTS
     anchor_ref = packet.block_map[ctx.anchor_key]
     slices = anchor_ref.inner_slices or (slice(None), slice(None))
     surfaces_in = _slice_collection(surface_blocks, slices)
     factors_in = _slice_collection(factors_2d, slices)
 
-    # BLEND the stack
-    img_block = workspace.compositor.blend_window(surfaces_in, factors_in, ctx.pipeline)
+    # RUN COMPOSITING PIPELINE WITH FACTORS AND SURFACES
+    img_block = workspace.compositor.run_pipeline(surfaces_in, factors_in, ctx.pipeline)
     img_block = img_block[:, :h, :w]
 
     # RETURN RESULT
@@ -123,26 +111,27 @@ class RenderWorkspace:
         res = ctx.resources
         needs_style_sync = False
 
-        # 1. TOPOLOGY OR LOGIC CHANGED
-        # If the structure of the pipeline or the math logic changes,
-        # we must rebuild the FactorEngine.
+        # 1. TOPOLOGY CHANGED OR LOGIC CHANGED
         if (
                 res.topology_hash != self.current_topology_hash or res.logic_hash !=
-                self.current_logic_hash or self.current_logic_hash is None):
-            noise_lib = NoiseLibrary(ctx.render_cfg, ctx.render_cfg.noises)
+                self.current_logic_hash):
+            #  identify the culprit
+            tag = "TOPOLOGY" if res.topology_hash != self.current_topology_hash else "LOGIC"
+
+            noise_lib = NoiseEngine(ctx.render_cfg, ctx.render_cfg.noises)
             noise_lib.attach_providers_shm()
 
             self.factor_eng = FactorEngine(
                 ctx.render_cfg, ctx.themes, noise_lib, ctx.render_cfg.factors, res, None
             )
+
+            # Update local state to stop further triggers
             self.current_topology_hash = res.topology_hash
             self.current_logic_hash = res.logic_hash
             needs_style_sync = True
 
         # 2. STYLE CHANGED
-        # If only the colors or theme parameters changed, we don't need
-        # to rebuild the FactorEngine, just the SurfaceEngine and LUTs.
-        if res.style_hash != self.current_style_hash or self.current_style_hash is None:
+        if res.style_hash != self.current_style_hash:
             self.surface_eng = SurfaceEngine(ctx.render_cfg)
             self.current_style_hash = res.style_hash
             needs_style_sync = True
@@ -151,19 +140,18 @@ class RenderWorkspace:
         if needs_style_sync:
             self.setup_style_state(ctx)
 
-    def _rebuild_logic_stack(self, ctx):
+    def ZZ_rebuild_logic_stack(self, ctx):
         """Creates fresh engines for a new logic state."""
-        noise_lib = NoiseLibrary(ctx.render_cfg, ctx.render_cfg.noises)
+        noise_lib = NoiseEngine(ctx.render_cfg, ctx.render_cfg.noises)
         noise_lib.attach_providers_shm()
 
         self.factor_eng = FactorEngine(
             ctx.render_cfg, ctx.themes, noise_lib, ctx.render_cfg.factors, ctx.resources, None
         )
 
-    def _rebuild_style_stack(self, ctx):
-        """Methodically pushes new settings into the existing engines."""
+    def ZZ_rebuild_style_stack(self, ctx):
+        """Pushes new settings into the existing engines."""
         # A. Hydrate the Theme Registry instance from the context
-        # This executes the 'DEBUG build runt' logic
         ctx.themes.load_metadata(ctx.render_cfg)
         ctx.themes.load_theme_style()
 
@@ -174,7 +162,7 @@ class RenderWorkspace:
 
         # C. Rebuild Surface Engine (always fresh for style changes)
         self.surface_eng = SurfaceEngine(ctx.render_cfg)
-        self.surface_eng.load_surface_ramps(ctx.resources)
+        self.surface_eng.configure_surface(ctx.resources)
 
     def setup_style_state(self, ctx: WorkerContext):
         """
@@ -192,7 +180,7 @@ class RenderWorkspace:
         # 3. SYNC the Surface Engine.
         # Ensure the ramp synthesis logic is using the current job's resource paths.
         if self.surface_eng:
-            self.surface_eng.load_surface_ramps(ctx.resources)
+            self.surface_eng.configure_surface(ctx.resources)
 
 
 def _prepare_compute_context(packet: RenderPacket, ctx: WorkerContext, pool_map):

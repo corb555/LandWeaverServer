@@ -72,7 +72,7 @@ class QmlPalette:
 
     def build_lut_rgb(
             self, *, size: int = DEFAULT_LUT_SIZE, fill_rgb: RGB = (0, 0, 0), ) -> np.ndarray:
-        """Build dense RGB LUT for uint8 index rasters.
+        """Build  RGB LUT for uint8 index rasters.
 
         Returns:
             (size, 3) uint8 LUT.

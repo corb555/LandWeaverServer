@@ -137,7 +137,7 @@ class ColorConfig():
         data = []
         with open(file_path, 'r') as f:
             for line_num, line in enumerate(f, 1):
-                #print(f"{line}")
+                # print(f"{line}")
                 raw_line = line.strip()
 
                 # 1. Handle Comments and Empty Lines

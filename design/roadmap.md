@@ -146,7 +146,7 @@ Refine map rendering with each sprint
 
 #### Sprint 2: Settings Migration
 
-* **Goal:** Replace `settings.py` with biome.yml
+* **Goal:** Replace `settings.py` with land weaver yml
 * **Impact:** This decouples the settings from the code.
 
 #### Sprint 3: The Hot Server (Goal 3: The < 2s Loop)

@@ -14,6 +14,7 @@ WindowRect: TypeAlias = tuple[int, int, int, int]
 WKR_TIMEOUT = 7.0
 ORCH_TIMEOUT = 10.0
 
+# Error severity
 SEV_FATAL = 0  # Fatal  error.  Shutting down.
 SEV_CANCEL = 1  # Job Cancellation.
 SEV_WARNING = 2  # Job continues with warning text sent to the client

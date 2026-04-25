@@ -1,11 +1,77 @@
+import ast
 from time import perf_counter
 from typing import Any
-import ast
+
+import cv2
 import numpy as np
+
+
+def validate_path(path):
+    if not path.exists():
+        raise FileNotFoundError(f"Path not found at: {path}")
+
+    if path.is_dir():
+        raise IsADirectoryError(f"Path is a directory, not a file: {path}")
+
+    if not path.is_file():
+        raise ValueError(f"Path is not a regular file: {path}")
+
+
+def optimized_blur(data: np.ndarray, sigma: float, mode: str = "wrap"):
+    """
+    Gaussian blur with manual support for BORDER_WRAP.
+    """
+    if sigma <= 0:
+        return data
+
+    h, w = data.shape[:2]
+
+    # 1. Determine effective data and sigma (Pyramidal logic)
+    if sigma >= 8.0:
+        scale = 4
+        # Note: slicing [::scale] is fine for the input to a blur
+        work_data = data[::scale, ::scale]
+        sigma_work = sigma / float(scale)
+    else:
+        scale = 1
+        work_data = data
+        sigma_work = sigma
+
+    # 2. Handle BORDER_WRAP Special Case
+    # OpenCV's GaussianBlur rejects BORDER_WRAP, so we pad manually
+    if mode == "wrap":
+        # A safe margin for Gaussian blur is 3.5 to 4.0 * sigma
+        pad = int(sigma_work * 4.0)
+        # Ensure padding isn't zero
+        pad = max(pad, 1)
+
+        # Manually create the circular wrap
+        padded = cv2.copyMakeBorder(work_data, pad, pad, pad, pad, cv2.BORDER_WRAP)
+
+        # Blur the padded version (Border type here doesn't matter much now)
+        blurred = cv2.GaussianBlur(padded, (0, 0), sigmaX=sigma_work)
+
+        # Crop back to the original work_data size
+        work_result = blurred[pad:-pad, pad:-pad]
+    else:
+        # Standard borders (Reflect, Replicate) are supported natively
+        border_map = {
+            "reflect": cv2.BORDER_REFLECT_101, "constant": cv2.BORDER_CONSTANT,
+            "nearest": cv2.BORDER_REPLICATE
+        }
+        cv2_border = border_map.get(mode, cv2.BORDER_DEFAULT)
+        work_result = cv2.GaussianBlur(work_data, (0, 0), sigmaX=sigma_work, borderType=cv2_border)
+
+    # 3. Final Upscale (if pyramidal)
+    if scale > 1:
+        return cv2.resize(work_result, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return work_result
+
 
 def dot_get(obj: Any, path: str, default: Any = None) -> Any:
     """
-    Retrieves a nested value from a dictionary or object using a dot-separated path.
+    Retrieves a nested value from a dictionary  using a dot-separated path.
     Example: dot_get(cfg, "sources.water.max_opacity")
     """
     if obj is None:
@@ -33,6 +99,7 @@ def dot_get(obj: Any, path: str, default: Any = None) -> Any:
             return default
 
     return current
+
 
 class TimerStats:
     def __init__(self):
@@ -118,6 +185,7 @@ def reset_print_once():
 
 EPSILON = 1e-6
 
+
 def lerp(a: np.ndarray, b: np.ndarray, t: np.ndarray) -> np.ndarray:
     """Linearly interpolate between arrays."""
     return a + t * (b - a)
@@ -136,39 +204,14 @@ def smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
 
 
 SAFE_FUNCTIONS = {
-    "clip": np.clip,
-    "min": np.minimum,
-    "max": np.maximum,
-    "pow": np.power,
-    "where": np.where,
-    "abs": np.abs,
-    "log": np.log,
-    "sqrt": np.sqrt,
-    "exp": np.exp,
-    "lerp": lerp,
-    "clamp": clamp,
+    "clip": np.clip, "min": np.minimum, "max": np.maximum, "pow": np.power, "where": np.where,
+    "abs": np.abs, "log": np.log, "sqrt": np.sqrt, "exp": np.exp, "lerp": lerp, "clamp": clamp,
     "smoothstep": smoothstep,
 }
 
-SAFE_NODE_TYPES = {
-    ast.Expression,
-    ast.BinOp,
-    ast.UnaryOp,
-    ast.Call,
-    ast.Name,
-    ast.Load,
-    ast.Constant,
-    ast.keyword,
-    ast.Tuple,
-    ast.List,
-    ast.USub,
-    ast.UAdd,
-    ast.Add,
-    ast.Sub,
-    ast.Mult,
-    ast.Div,
-    ast.Pow,
-}
+SAFE_NODE_TYPES = {ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call, ast.Name, ast.Load,
+                   ast.Constant, ast.keyword, ast.Tuple, ast.List, ast.USub, ast.UAdd, ast.Add,
+                   ast.Sub, ast.Mult, ast.Div, ast.Pow, }
 
 
 def compile_expression(expr_str: str) -> Any:

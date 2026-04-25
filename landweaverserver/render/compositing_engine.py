@@ -21,7 +21,7 @@ class CompositingEngine:
         # self.tmr = timer
         self.target_shape = None  # (H, W) locked during first step
 
-    def blend_window(
+    def run_pipeline(
             self, surfaces: Dict[SurfaceKey, np.ndarray], factors: Dict[str, np.ndarray],
             pipeline: List[_BlendSpec]
     ) -> np.ndarray:
@@ -75,19 +75,23 @@ class CompositingEngine:
                     buffers=buffers, surfaces=active_surfaces, factors=factors, factor=factor,
                     spec=step, ctx=self
                 )
-            except MemoryError as e:
+            except Exception as e:
                 # Capture high-fidelity failure metadata
                 self._log_pipeline_error(e, i, step, buffers)
                 raise e
 
+            # Once we have output the buffer, go to next step!
+            if step.blend_op == "output_buffer":
+                continue
+
         # 5. FINALIZE FOR STORAGE
-        # Extract the buffer designated by the 'write_output' op
+        # Extract the buffer designated by the 'output_buffer' op
         final_img = buffers.get("__final_output__")
 
         if final_img is None:
             print("blend image error")
             raise ValueError(
-                "pipeline produced no output. Ensure 'write_output' is enabled in biome.yml."
+                "pipeline produced no output. Ensure 'output_buffer' is enabled in land weaver yml"
             )
 
         # ENGINE CONTRACT: Final conversion from (H, W, 3) float -> (3, H, W) uint8

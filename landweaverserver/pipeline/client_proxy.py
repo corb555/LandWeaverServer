@@ -8,23 +8,27 @@ from typing import Optional
 
 from landweaverserver.common.ipc_packets import Envelope, Op
 
+MAX_TOKEN_LEN = 1024
+
 
 class ClientProxy:
     """
-    Dedicated networking class for the Unix socket.
-
-    Handles newline-delimited JSON framing and lightweight
-    protocol-level validation.
+    Handles NDJSON messaging between the Daemon and Client
+    Has a receive thread and a send thread
+    All messaaging to Daemon goes via mp queue
+    Ensures client messages are valid NDJSON, reasonable length and pass the specified schema
     """
 
     ACCEPT_TIMEOUT_S = 1.0
     RESPONSE_TIMEOUT_S = 1.0
 
     def __init__(
-            self, socket_path: str, status_q: "mp.Queue", response_q: "mp.Queue", ) -> None:
+            self, socket_path: str, status_q: "mp.Queue", response_q: "mp.Queue", request_schema
+    ) -> None:
         self.socket_path = socket_path
         self.status_q = status_q
         self.response_q = response_q
+        self.request_schema = request_schema
 
         self.running = False
         self._threads: list[threading.Thread] = []
@@ -37,7 +41,7 @@ class ClientProxy:
 
     def start(self) -> None:
         """Initialize the Unix socket and start communication threads."""
-        print(f"➡️ [CommandProxy] Opening socket at {self.socket_path}")
+        print(f"➡️ [ClientProxy] Opening socket at {self.socket_path}")
 
         try:
             if os.path.exists(self.socket_path):
@@ -80,14 +84,18 @@ class ClientProxy:
         self._set_active_connection(None)
 
     def _rcv_loop(self) -> None:
-        """Listen for NDJSON commands from the Editor."""
+        """Listen for NDJSON commands from clients
+        """
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server_socket = server
+
+        ACCEPT_TIMEOUT = 5.0
+        MAX_MSG_LEN = 1024
 
         try:
             server.bind(self.socket_path)
             server.listen(1)
-            server.settimeout(self.ACCEPT_TIMEOUT_S)
+            server.settimeout(ACCEPT_TIMEOUT)
 
             while self.running:
                 try:
@@ -95,30 +103,34 @@ class ClientProxy:
                 except socket.timeout:
                     continue
                 except OSError:
-                    if self.running:
-                        self.status_q.put(
-                            Envelope(
-                                op=Op.ERROR, payload=(-1, "COMMAND_RCV", "Socket accept failed"), )
-                        )
                     break
 
                 self._set_active_connection(conn)
-                print("✅ [CommandProxy] Editor connected")
 
                 try:
-                    with conn, conn.makefile("r", encoding="utf-8") as f:
+                    with conn, conn.makefile("r", encoding="utf-8", buffering=1) as stream:
                         while self.running:
-                            line = f.readline()
+                            line = stream.readline(MAX_MSG_LEN)
                             if not line:
                                 break
 
-                            self._handle_incoming_line(line)
-                except OSError as exc:
-                    self.status_q.put(
-                        Envelope(
-                            op=Op.ERROR,
-                            payload=(-1, "COMMAND_RCV", f"Socket read failed: {exc}"), )
-                    )
+                            if not line.endswith("\n"):
+                                print(
+                                    f"❌ [ClientProxy] Rejected oversized message "
+                                    f"(>{MAX_MSG_LEN} chars)."
+                                )
+                                break
+                            try:
+                                data = json.loads(line)
+                                self._handle_incoming_line(data)
+                            except Exception as exc:
+                                print(
+                                    f"❌ [ClientProxy] Malformed JSON. Disconnecting client. {exc}"
+                                    )
+                                break
+
+                except (OSError, UnicodeDecodeError) as exc:
+                    print(f"⚠️ [CommandProxy] Connection error: {exc}")
                 finally:
                     self._clear_active_connection()
 
@@ -127,74 +139,58 @@ class ClientProxy:
                 server.close()
             except OSError:
                 pass
-            self._server_socket = None
 
-    def _handle_incoming_line(self, line: str) -> None:
-        """Parse and validate one inbound JSON line."""
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            print("❌ [CommandProxy] Received malformed JSON")
-            self._queue_protocol_error("Protocol error: malformed JSON")
-            return
+    def _handle_incoming_line(self, data: dict) -> None:
+        """Parse and validate one inbound NDJSON line."""
+        # ---  LOGICAL VALIDATION (Cerberus) ---
+        from cerberus import Validator
+        job_id = data.get("job_id", "")
+        v = Validator(self.request_schema)
 
-        if not isinstance(data, dict):
-            self._queue_protocol_error("Protocol error: message must be a JSON object")
-            return
+        if not v.validate(data):
+            # Message is structurally valid but parameters are wrong.
+            # We respond with an error so the Client can tell the user why.
+            error_details = v.errors
+            print(f"⚠️ [CommandProxy] Parameter validation failed for '{job_id}' : {error_details}")
 
-        msg_type = data.get("msg")
-        job_id = data.get("job_id")
-
-        if msg_type == "job_request":
-            if job_id is None:
-                self._queue_protocol_error(
-                    "Protocol error: job request missing job_id"
-                )
-                return
-            if "params" not in data:
-                self._queue_protocol_error(
-                    "Protocol error: job request missing params"
-                )
-                return
-
-            self.status_q.put(
-                Envelope(op=Op.JOB_REQUEST, payload=data)
+            self.response_q.put(
+                {
+                    "msg": "error", "job_id": job_id, "severity": 1,  # SEV_CANCEL
+                    "message": f"Invalid render parameters: {error_details}"
+                }
             )
             return
 
-        if msg_type == "halt":
-            self.status_q.put(Envelope(op=Op.JOB_CANCEL))
-            return
-
-        print(f"⚠️ [CommandProxy] Unknown message type: {msg_type}")
-        self._queue_protocol_error(f"Protocol error: unknown msg type '{msg_type}'")
+        # --- SUCCESS: DISPATCH TO ORCHESTRATOR ---
+        print(
+            f" [CommandProxy] Accepted Render Request: Job '{job_id}' ({data['params']['prefix']})"
+        )
+        self.status_q.put(Envelope(op=Op.JOB_REQUEST, payload=data))
 
     def _rsp_loop(self) -> None:
-        """Listen to response_queue and send updates back to the Editor."""
+        """Send NDJSON responses with write timeouts."""
         while self.running:
             try:
-                payload = self.response_q.get(timeout=self.RESPONSE_TIMEOUT_S)
+                #  Wait for data from the Orchestrator
+                payload = self.response_q.get(timeout=1.0)
+                if payload is None: break  # Poison pill
             except Empty:
                 continue
-            except (OSError, EOFError):
-                # This triggers if the queue handle is closed while we are waiting
-                # We exit the loop quietly as the system is shutting down
-                break
 
             conn = self._get_active_connection()
-            if conn is None:
-                continue
+            if conn is None: continue
 
             try:
+                # ensure the underlying socket won't block forever
+                conn.settimeout(2.0)
+
                 msg = json.dumps(payload) + "\n"
                 conn.sendall(msg.encode("utf-8"))
-            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+
+            except (socket.timeout, BrokenPipeError, OSError) as exc:
+                # If the client is gone or their buffer is jammed, drop connection
                 self._clear_active_connection()
-                print(f"❌ [CommandProxy] Connection lost. Response dropped: {exc}")
-                self.status_q.put(
-                    Envelope(
-                        op=Op.ERROR, payload=(-1, "COMMAND_RSP", f"Socket write failed: {exc}"), )
-                )
+                print(f"❌ [CommandProxy] Send failed (Timeout or Reset): {exc}")
 
     def _queue_protocol_error(self, message: str) -> None:
         """Queue a protocol-level error response for the client."""
@@ -203,7 +199,6 @@ class ClientProxy:
     def stop(self) -> None:
         """Stop threads and clean up socket resources."""
         self.running = False
-
         self._clear_active_connection()
 
         if self._server_socket is not None:

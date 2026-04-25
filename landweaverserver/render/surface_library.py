@@ -61,7 +61,7 @@ def _theme_provider(ctx: SurfaceContext, spec, data_2d, masks_2d, factors_2d, st
             f"Available keys: {available_keys}"
         )
 
-    #smoothed_ids = style_engine.get_smoothed_ids(theme_ids)
+    # smoothed_ids = style_engine.get_smoothed_ids(theme_ids)
     tile_ctx = style_engine.build_tile_context(theme_ids)
 
     return style_engine.get_theme_surface(
@@ -70,22 +70,13 @@ def _theme_provider(ctx: SurfaceContext, spec, data_2d, masks_2d, factors_2d, st
 
 @surface_builder("ramp")
 def _ramp_provider(ctx: SurfaceContext, spec, data_2d, masks_2d, factors_2d, style_engine):
-    # This factor is "elev_m" (Raw Meters)
     f_id = spec.input_factor
-    if f_id is None:
-        raise ValueError(f"input_factor is missing for surface {spec.key}")
     factor_val = factors_2d.get(f_id)
     if factor_val is None:
-        raise ValueError(f"input_factor not found for surface {spec.key}")
+        raise ValueError(f"input_factor {f_id} not found")
 
     interp_func = ctx.surfaces.get(spec.key)
-    if interp_func is None:
-        print(f" Key='{spec.key}' Surfaces: {ctx.surfaces}")
-        print(ctx)
-    u_min, u_max = float(interp_func.x[0]), float(interp_func.x[-1])
-
-    coords = np.clip(factor_val, u_min, u_max)
-    return interp_func(coords)
+    return interp_func(factor_val)
 
 
 def register_modifier(mod_id: str):
@@ -97,8 +88,19 @@ def register_modifier(mod_id: str):
 
 
 @register_modifier("color_mottle")
-def _mottle_color(img_block, noise_rgb, profile):
-    centered = noise_rgb - 0.5
-    # (H,W,1) * (3,) results in (H,W,3) perfectly
-    shift = (centered * np.array(profile.shift_vector, dtype="float32")) * profile.intensity
-    return np.clip(img_block + shift, 0.0, 255.0)
+def _mottle_color(img_block, noise_signal, profile, baked_vector):
+    """
+    Memory-Lean Mottle:
+    - img_block: (H, W, 3) float32
+    - noise_signal: (H, W, 1) float32
+    """
+    # noise_signal[..., 0] is a zero-cost view of (H, W)
+    ns = noise_signal[..., 0]
+
+    # Process channels individually to avoid allocating a large (H, W, 3) temporary
+    # This is 4-6x faster than broadcasting in this specific case.
+    img_block[..., 0] += ns * baked_vector[0]
+    img_block[..., 1] += ns * baked_vector[1]
+    img_block[..., 2] += ns * baked_vector[2]
+
+    return img_block

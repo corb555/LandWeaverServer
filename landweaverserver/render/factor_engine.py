@@ -39,6 +39,7 @@ class FactorRegistry:
             )
         return fn
 
+
 class FactorEngine:
     def __init__(
             self, cfg: Any, themes: Any, noise_registry: Any, factor_specs: List[Any],
@@ -62,11 +63,10 @@ class FactorEngine:
                     f"\n❌ Factor Engine Initialization Error:\n"
                     f"   Factor '{spec.name}' requested an unknown factor_builder: '"
                     f"{spec.factor_builder}'.\n"
-                    f"   Check your FACTOR_SPECS in settings.py or biome.yml for typos.\n"
+                    f"   Check your FACTOR_SPECS in settings.py or land weaver yml for typos.\n"
                     f"   Available Function IDs: {available}"
                 )
 
-            # print(f"Registered factor {spec.name}")
             self._compiled.append((spec, fn))
 
     def update_render_context(self, render_cfg: 'RenderConfig', themes: 'ThemeRegistry'):
@@ -126,8 +126,7 @@ class FactorEngine:
 
             except Exception as e:
                 print(f"\n❌ Factor Engine Error: [{spec.name}]")
-                traceback.print_exc() # Prints exactly which line in factor_library failed
-                # 'from e' ensures the Upstream error is linked to this new error
+                traceback.print_exc()
                 raise RuntimeError(f"Factor Engine failure on {spec.name}") from e
 
         return factors
@@ -159,4 +158,3 @@ class FactorEngine:
             msg += f" | valid_mean={v_mean:.3f} valid_zeros={v_zeros:.3f}"
 
         print_once(f"source_stats_{name}", msg)
-

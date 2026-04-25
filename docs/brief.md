@@ -59,7 +59,7 @@ Factors act as the control signals for the entire render, conditioned from physi
 
 Surfaces are the "Materials" of the map, synthesized as RGB data through various providers:
 
-* **Ramp Synthesis:** Samples 1D color ramps using physical meters (`elev_m`) for sub-pixel precision,
+* **Ramp Synthesis:** Samples 1D color ramps using  meters (`elev_m`) for sub-pixel precision,
   eliminating the banding and data loss of traditional 8-bit normalization.
 * **Hue Perturbation (Mottle):** Noise-driven RGB hue shifting that adds tactile "surface tooth" and
   geological grit to otherwise flat digital gradients.
@@ -150,11 +150,11 @@ Design Notes:
   and job context live in shared memory.
 - ``job_id`` validation is the primary safeguard against stale packets from
   earlier jobs.
-- rendering is entirely controlled by biome.yml settings.
+- rendering is entirely controlled by land weaver yml settings.
 - the rendering system consists of multiple engines with feature libraries
-- there are 4 major engines with feature libraries: factor_engine, compositing_engine, noise_library, surface_engine
+- there are 4 major engines with feature libraries: factor_engine, compositing_engine, noise_engine, surface_engine
 - for example, the compositing engine launches actions from the library: create_buffer, lerp,
-  multiply, alpha_over, apply_zonal_gradient, write_output
+  multiply, alpha_over, apply_zonal_gradient, output_buffer
 
 Execution Flow - Happy Path:
 

@@ -248,10 +248,17 @@ class SlotRegistry:
         self.is_cold = True
         self.pool_map = pool_map
         self.context_id = context_id
-        self.is_warm_hit_detected = False
+
+        # Telemetry
         self.hits = 0
         self.misses = 0
-        self.transit_demands = 0
+        self.is_warm_hit_detected = False
+
+        # --- TRANSIT PRESSURE TRACKING ---
+        # Tracks current concurrent usage per pool
+        self.transit_active_count = {k: 0 for k in pool_map.keys()}
+        # Tracks peak concurrent usage per pool
+        self.transit_hwm = {k: 0 for k in pool_map.keys()}
 
         self.static_cache = {k: {} for k in pool_map.keys()}
         self.ref_counts = {k: collections.defaultdict(int) for k in pool_map.keys()}
@@ -259,39 +266,32 @@ class SlotRegistry:
         self.static_available = {}
         self.transit_indices = {k: set() for k in pool_map.keys()}
 
+        # Partitioning logic
+        first_pool = next(iter(pool_map.values()))
+        self.static_max = min(static_count, first_pool.slots - 1)
+        self.transit_max = first_pool.slots - self.static_max
+
         for key, pool in pool_map.items():
-            # Use the explicit count passed from the Orchestrator
-            # (Ensuring we don't exceed actual pool capacity)
-            actual_static = min(static_count, pool.slots - 1)
-
-            # Drain all indices to partition them
             all_indices = [pool.acquire(block=False) for _ in range(pool.slots)]
-
-            # Partition
-            self.static_available[key] = sorted(all_indices[:actual_static])
-            transits = all_indices[actual_static:]
-
-            # Put transit indices back into the pool's shared queue
+            self.static_available[key] = sorted(all_indices[:self.static_max])
+            transits = all_indices[self.static_max:]
             for idx in transits:
                 self.transit_indices[key].add(idx)
                 pool.release(idx)
 
     def start_session(self):
-        """Called by Orchestrator at the start of every job."""
+        """Reset peak trackers for the new job."""
         self.hits = 0
         self.misses = 0
-        self.transit_demands = 0
         self.is_warm_hit_detected = False
+        # Reset High Water Mark for the new session
+        for k in self.transit_hwm:
+            self.transit_hwm[k] = 0
 
     def get_or_allocate(self, key: SourceKey, window: Window) -> Tuple[int, bool]:
-        """
-        Coordinates slot assignment using a stable spatial key.
-        Returns (slot_id, is_cached).
-        """
-        # Stable identity based on global pixel offsets
         win_key = (window.col_off, window.row_off, window.width, window.height)
 
-        # 1. STATIC CACHE HIT
+        # 1.  CACHE HIT
         if win_key in self.static_cache[key]:
             slot_id = self.static_cache[key][win_key]
             self.ref_counts[key][slot_id] += 1
@@ -299,7 +299,7 @@ class SlotRegistry:
             self.is_warm_hit_detected = True
             return slot_id, True
 
-        # 2. STATIC CACHE MISS: TRY PRIMING STATIC ZONE
+        # 2.  CACHE MISS - ADD TO CACHE
         self.misses += 1
         if self.static_available[key]:
             slot_id = self.static_available[key].pop(0)
@@ -307,60 +307,48 @@ class SlotRegistry:
             self.ref_counts[key][slot_id] = 1
             return slot_id, False
 
-        # 3. STATIC ZONE FULL: USE TRANSIT SLOT (SCRATCHPAD)
-        # This acts as a cache miss every time for blocks beyond the static capacity.
-        self.transit_demands += 1
-
+        # 3. CACHE FULL - USE TRANSIT ALLOCATION
         pool = self.pool_map[key]
         try:
-            # Transit slots are acquired from the shared Pool Queue
             slot_id = pool.acquire(block=False)
             self.ref_counts[key][slot_id] = 1
+
+            # Update High Water Mark
+            self.transit_active_count[key] += 1
+            if self.transit_active_count[key] > self.transit_hwm[key]:
+                self.transit_hwm[key] = self.transit_active_count[key]
+
             return slot_id, False
         except:
-            # If both zones are exhausted, we must wait or fail
             raise RuntimeError(
-                f"Memory Exhausted for {key}. "
-                f"Static zone is frozen and Transit zone is fully utilized by active workers. "
-                f"Increase total slots or reduce MAX_IN_FLIGHT."
+                f"Pool Exhausted for '{key}'. The Transit slots reached capacity "
+                f"({self.transit_hwm[key]} / {self.transit_max} slots). "
+                f"To fix this, increase 'transit_buffer_factor' in land weaver settings yml, "
+                f"or decrease the number of concurrent render processes."
             )
 
     def release(self, key: SourceKey, slot_id: int):
-        """
-        Indicates a block is no longer needed by a specific tile.
-        Static slots remain pinned; Transit slots return to the pool.
-        """
         if self.ref_counts[key][slot_id] <= 0:
             return
 
         self.ref_counts[key][slot_id] -= 1
 
-        # Only return to pool if it's a Transit slot and no one else is using it
         if self.ref_counts[key][slot_id] == 0:
             if slot_id in self.transit_indices[key]:
+                # Decrement active transit count before returning to pool
+                self.transit_active_count[key] -= 1
                 self.pool_map[key].release(slot_id)
-            else:
-                # It is a Static slot. We do not release it to the pool;
-                # it stays in self.static_cache forever for this context.
-                pass
 
     def get_telemetry(self) -> dict:
-        """Returns raw counters and physical memory usage for the Orchestrator."""
-        total_bytes = 0
-        for pool in self.pool_map.values():
-            # Sum up data and mask buffers
-            total_bytes += pool._d_shm.size + pool._m_shm.size
-
-        # Calculate usage of the Static partition from the first  pool
+        total_bytes = sum(p._d_shm.size + p._m_shm.size for p in self.pool_map.values())
         first_key = next(iter(self.static_cache))
-        used = len(self.static_cache[first_key])
-        total = used + len(self.static_available[first_key])
 
         return {
-            "mb_allocated": total_bytes / (1024 * 1024), "slots_used": used, "slots_total": total,
-            "hits": self.hits, "misses": self.misses, "transit_demands": self.transit_demands,
-            # New
-            "is_cold": not self.is_warm_hit_detected
+            "mb_allocated": total_bytes / (1024 * 1024),
+            "static_used": len(self.static_cache[first_key]), "static_total": self.static_max,
+            "transit_max": self.transit_max, "transit_hwm": self.transit_hwm[first_key],
+            # Peak concurrent usage
+            "hits": self.hits, "misses": self.misses, "is_cold": not self.is_warm_hit_detected
         }
 
     def reset_context(self, new_context_id: str):
@@ -376,3 +364,4 @@ class SlotRegistry:
             self.static_available[key].extend(mapped_ids)
             self.static_available[key].sort()
             self.static_cache[key].clear()
+            self.ref_counts[key].clear()

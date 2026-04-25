@@ -39,8 +39,7 @@ class ReaderContext(WorkerContextBase):
 
     def open_local_resources(self) -> None:
         """
-        FIX: This method is called by sync_ctx_for_packet.
-        It must physically create the IOManager and open the file handles.
+          create the IOManager and open the file handles.
         """
         # 1. Clean up if already open (sanity check)
         self.close_local_resources()
@@ -49,16 +48,16 @@ class ReaderContext(WorkerContextBase):
         # We use the config and paths that WERE pickled
         self._io = IOManager(
             render_cfg=self.render_cfg, sources=self.source_paths, anchor_key=self.anchor_key
-            )
+        )
 
-        # 3. Physically open the Rasterio handles
+        # 3.  open the Rasterio handles
         # This makes the IOManager 'Live' in this specific process
         self._io.__enter__()
 
         # print(f"✅ [ReaderContext] Local resources initialized for Job {self.job_id}")
 
     def close_local_resources(self) -> None:
-        """Physically close file handles."""
+        """ close file handles."""
         if self._io is not None:
             try:
                 self._io.__exit__(None, None, None)
@@ -110,7 +109,7 @@ class WriterContext(WorkerContextBase):
         return self._dst
 
     def open_local_resources(self) -> None:
-        """Physically open the .tmp file for writing."""
+        """ open the .tmp file for writing."""
         self.close_local_resources()
 
         # Guard against race conditions during cancellation

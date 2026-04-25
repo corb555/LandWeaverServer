@@ -19,7 +19,7 @@ class IOSystem:
     @staticmethod
     def initialize_physical_output(out_path: Path, profile: dict) -> List[Window]:
 
-        print(f"[IOSystem] Initializing physical output: {out_path.name}")
+        print(f"[IOSystem] Initializing  output: {out_path.name}")
 
         # Open in 'w' mode and close immediately to commit the header to disk.
         with rasterio.open(out_path, "w", **profile) as _:
@@ -33,7 +33,6 @@ class IOSystem:
         if not win_list:
             raise ValueError(f"❌ Geometry Error: Could not determine windows for {out_path}")
 
-        print(f"[IOSystem] Output grid calculated: {len(win_list)} tiles.")
         return win_list
 
     @staticmethod
@@ -53,7 +52,7 @@ class IOSystem:
             # We use a context manager for IOManager to safely probe the sources
             with IOManager(
                     manifest.render_cfg, manifest.resources.sources, manifest.resources.anchor_key
-                    ) as io:
+            ) as io:
                 for dkey in manifest.resources.sources:
                     # Get or allocate from registry (handled by Dispatcher, but used here for ID)
                     slot_id, _ = registry.get_or_allocate(dkey, window)
@@ -146,8 +145,7 @@ class IOManager:
         # 2. This will hold the open Rasterio DatasetReaders
         self.sources: Dict[Any, rasterio.DatasetReader] = {}
 
-        self._stack = ExitStack()
-        # print(f"IOManager paths to open={self.source_paths}")
+        self._stack = ExitStack()  # print(f"IOManager paths to open={self.source_paths}")
 
     def __enter__(self):
         # 3. Iterate over the PATHS dictionary
@@ -157,7 +155,9 @@ class IOManager:
                 self.sources[dkey] = self._stack.enter_context(rasterio.open(path))
             except Exception as e:
                 if path is None:
-                    raise IOError(f"Error: source '{dkey}' path is None. Check YAML 'sources' section.")
+                    raise IOError(
+                        f"Error: source '{dkey}' path is None. Check YAML 'sources' section."
+                    )
                 else:
                     raise IOError(f"Error for '{dkey}' path: '{path}'. {str(e)}")
         return self
@@ -210,7 +210,9 @@ class IOManager:
         # This will now work because self.sources was populated in __enter__
         if self.anchor_key not in self.sources:
             available = list(self.sources.keys())
-            raise KeyError(f"Anchor '{self.anchor_key}' not found in open sources. Available: {available}")
+            raise KeyError(
+                f"Anchor '{self.anchor_key}' not found in open sources. Available: {available}"
+            )
         return self.sources[self.anchor_key]
 
     def read_source_block_ref(

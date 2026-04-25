@@ -1,5 +1,6 @@
 # Changelog
 
+- 2.2 [STABILITY] Cleaned up separation of Pipeline and RenderSystem. Added Idle shutdown.
 - 2.1 [PERF] Improved Noise creation speed
 - 2.0 [STABILITY] Combined Factor and Logic config sections.
 - 1.9 [STABILITY] Added detailed render config verification

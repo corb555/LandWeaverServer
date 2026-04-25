@@ -2,12 +2,12 @@ from functools import wraps
 from typing import Dict, Callable, Any
 
 import numpy as np
+from scipy import ndimage
 
 # factor_library.py
 from landweaverserver.render.spatial_math import normalize_step, lerp
 from landweaverserver.render.theme_registry import refine_signal
 from landweaverserver.render.utils import SAFE_FUNCTIONS
-from scipy import ndimage
 
 # factor_library.py
 
@@ -46,12 +46,11 @@ def factor_builder(factor_builder_nm: str):
 
 def _mapped_signal(data_2d, masks_2d, name, lib_ctx, source_key):
     """
-    'Remapping' factors
-    Raw -> Normalize ->  Refine -> Masked Default.
+
     """
     params = lib_ctx.spec.params
 
-    # requires start and full.
+    # Requires start and full.
     if "start" not in params or "full" not in params:
         raise KeyError(
             f"Factor '{name}' uses a mapping function but is missing "
@@ -87,10 +86,10 @@ def _mapped_signal(data_2d, masks_2d, name, lib_ctx, source_key):
             f"The Renderer requires strictly 2D (H,W) planes."
         )
 
-    # 1. Normalize range: Linear normalization based on config start/full
+    # 1. Normalize range: Linear normalization based on  start/full
     remapped = normalize_step(raw_plane, float(params.get("start")), float(params.get("full")))
 
-    # 2. Blur, Noise, Contrast, and Power-curves
+    # 2. Blur, Noise, Contrast, and Power-curves if global refine_signal is true
     if lib_ctx.cfg.raw_defs.get("refine_signal"):
         refined_2d = refine_signal(
             mask=remapped, params=lib_ctx.spec.params, ctx=lib_ctx, diag_name=name
@@ -117,28 +116,36 @@ def _mapped_signal(data_2d, masks_2d, name, lib_ctx, source_key):
 
 
 # -----------------------------------------------------------------------------
-# The Library
+# Factor Library
 # -----------------------------------------------------------------------------
 
 class FactorLibrary:
     @staticmethod
+    @factor_builder("mapped_signal")
+    def mapped_signal(data_2d, masks_2d, name, lib_ctx):
+        """
+        """
+        source_key = next(iter(lib_ctx.spec.sources))
+        return _mapped_signal(data_2d, masks_2d, name, lib_ctx, source_key)
+
+    @staticmethod
     @factor_builder("raw_source")
     def raw_source(data_2d, masks_2d, name, lib_ctx):
         """
-        Identity Operation: Promotes a physical source to a logical factor.
+        Identity Operation: Promotes a  source to a logical factor.
 
         This function  moves raw data from the
-        physical input dictionary (data_2d) to the logical factor dictionary
+         input dictionary (data_2d) to the logical factor dictionary
         (factors_2d) without modification.
 
         Architectural Purpose:
         1. DIMENSIONAL FIREWALL: Ensures the data is squeezed into a strictly
            2D NumPy array, removing any band or shared-memory slot dimensions.
         2. STABLE ALIASING: Allows the user to link a logical name (e.g., 'elev_m')
-           to a physical file (e.g., 'terrain_v4.tif') so that changing files
+           to a  file (e.g., 'terrain_v4.tif') so that changing files
            doesn't require updating every surface or pipeline step.
         3. PACKAGE ISOLATION: Allows the Rendering Engines to remain 'blind' to
-           the physical Source Pool, operating only on the Factor signal dictionary.
+           the  Source Pool, operating only on the Factor signal dictionary.
 
         Use Cases:
         - Providing 'elev_m' (raw meters) as a coordinate for color ramp sampling.
@@ -147,7 +154,7 @@ class FactorLibrary:
 
         Sources: [Target_Source] (The first source in the YAML list is used)
         """
-        # 1. Physical Lookup
+        # 1.  Lookup
         # We use the explicit source name provided in the factor's 'sources' list
         if not lib_ctx.spec.sources:
             raise ValueError(f"Factor '{name}' (raw_source) requires at least one source.")
@@ -159,18 +166,12 @@ class FactorLibrary:
         raw_data = data_2d.get(drv_key)
 
         if raw_data is None:
-            raise KeyError(f"Factor '{name}' requested source '{drv_key}', but it is missing from memory.")
+            raise KeyError(
+                f"Factor '{name}' requested source '{drv_key}', but it is missing from memory."
+            )
 
         # 3. Direct Return (Identity Math)
         return np.squeeze(raw_data)
-
-    @staticmethod
-    @factor_builder("mapped_signal")
-    def mapped_signal(data_2d, masks_2d, name, lib_ctx):
-        """
-        """
-        source_key = next(iter(lib_ctx.spec.sources))
-        return _mapped_signal(data_2d, masks_2d, name, lib_ctx, source_key)
 
     @staticmethod
     @factor_builder("theme_composite")
@@ -216,7 +217,7 @@ class FactorLibrary:
         # 1. Normalize Input
         # 'input_scale' allows handling both 8-bit (255) and float (1.0) sources
         scale = float(params.get("input_scale", 255.0))
-        val = np.clip(raw_signal / scale, 0.0, 1.0)
+        val = (raw_signal / scale).clip(0.0, 1.0)
 
         # 2. Volume Adjustment (Gamma)
         gamma = float(params.get("gamma", 1.0))
@@ -227,16 +228,18 @@ class FactorLibrary:
         # Prevents the signal from pushing pixels to pure black or pure white.
 
         # Shadow protection:
-        t_low = (val - float(params["low_start"])) / max(
-            float(params["low_end"]) - float(params["low_start"]), 1e-6
-        )
-        w_low = (1.0 - np.clip(t_low, 0, 1)) * float(params["protect_lows"])
+        div_low = max(float(params["low_end"]) - float(params["low_start"]), 1e-6)
+        t_low = (val - float(params["low_start"])) / div_low
+        # ✅ Optimize: Clip in-place into t_low
+        t_low.clip(0, 1, out=t_low)
+        w_low = (1.0 - t_low) * float(params["protect_lows"])
 
         # Highlight protection:
-        t_high = (val - float(params["high_start"])) / max(
-            float(params["high_end"]) - float(params["high_start"]), 1e-6
-        )
-        w_high = np.clip(t_high, 0, 1) * float(params["protect_highs"])
+        div_high = max(float(params["high_end"]) - float(params["high_start"]), 1e-6)
+        t_high = (val - float(params["high_start"])) / div_high
+        # ✅ Optimize: Clip in-place into t_high
+        t_high.clip(0, 1, out=t_high)
+        w_high = t_high * float(params["protect_highs"])
 
         # Combine protection weights and apply to the signal
         m_protected = val + np.maximum(w_low, w_high) * (1.0 - val)
@@ -269,7 +272,7 @@ class FactorLibrary:
         noise = np.squeeze(noise_provider.window_noise(lib_ctx.window, scale_override=scale))
 
         # Math: Subtract floor, clip, then apply aggressive power curve
-        n = np.clip(noise + floor - 0.5, 0, 1)
+        n = (noise + (floor - 0.5)).clip(0, 1)
         glints = np.power(n, 10.0 / max(sensitivity, 0.1))
 
         return glints * mask
@@ -317,7 +320,7 @@ class FactorLibrary:
         # 2. DISTANCE NORMALIZATION
         # max_range_px: At what distance from shore do we reach 'deep water' (1.0)?
         max_d = float(params.get("max_range_px", 100.0))
-        res = np.clip(prox_data / max(max_d, 0.1), 0.0, 1.0)
+        res = (prox_data / max_d).clip(0.0, 1.0)
 
         # 3. RIVER BOOST (Non-linear Shaping)
         # sensitivity > 1.0 makes small proximity values (rivers) much stronger.
@@ -401,7 +404,7 @@ class FactorLibrary:
 
     This function creates organic transitions (like snowlines, tree-lines, or
     vegetation bands) by combining a primary geographic signal with stochastic
-    jitter, then subjecting the result to a physical constraint.
+    jitter, then subjecting the result to a  constraint.
 
     Logic Flow:
     1. PERTURBATION: The primary source (e.g., Elevation) is displaced by a noise
@@ -430,10 +433,12 @@ class FactorLibrary:
         −
         10
         45−10
-        ). It then fades linearly from 1.0 to 0.0 between 35° and 45°. At 45° and above, the signal is completely stripped away (0.0).
+        ). It then fades linearly from 1.0 to 0.0 between 35° and 45°. At 45° and above, 
+        the signal is completely stripped away (0.0).
 
     Sources: [Primary_Source, Constraint_Source]
     """
+
     @staticmethod
     @factor_builder("constrained_signal")
     def constrained_signal(data_2d, masks_2d, name, lib_ctx):
@@ -468,10 +473,8 @@ class FactorLibrary:
         invert = params.get("invert_threshold", False)
 
         if ramp > 0:
-            # Smooth linear transition centered on the threshold
-            mask = np.clip((effective_signal - (threshold - ramp / 2)) / ramp, 0.0, 1.0)
+            mask = ((effective_signal - (threshold - ramp / 2)) / ramp).clip(0.0, 1.0)
         else:
-            # Hard binary edge at the threshold
             mask = (effective_signal >= threshold).astype(np.float32)
 
         if invert:
@@ -483,7 +486,8 @@ class FactorLibrary:
 
         # Calculate the raw penalty based on slope
         if limit_fade > 0:
-            penalty = 1.0 - np.clip((constraint_data - (limit - limit_fade)) / limit_fade, 0.0, 1.0)
+            penalty_step = ((constraint_data - (limit - limit_fade)) / limit_fade).clip(0.0, 1.0)
+            penalty = 1.0 - penalty_step
         else:
             penalty = (constraint_data <= limit).astype(np.float32)
 
@@ -494,9 +498,8 @@ class FactorLibrary:
             # We use a Gaussian blur on the penalty mask itself
             penalty = ndimage.gaussian_filter(penalty, sigma=constraint_blur)
 
-            # Optional: Re-sharpen the penalty to keep the cliff edges crisp
-            # but the narrow lines gone.
-            #penalty = np.clip(penalty * 1.2, 0.0, 1.0)
+            # Optional: Re-sharpen the penalty to keep the cliff edges crisp  # but the narrow  #
+            # lines gone.  # penalty = np.clip(penalty * 1.2, 0.0, 1.0)
 
         return np.squeeze(mask * penalty)
 
@@ -540,7 +543,9 @@ class FactorLibrary:
         try:
             result = eval(code, {"__builtins__": {}}, namespace)
         except Exception as exc:
-            raise RuntimeError(f"Math error in raster_calculator expression '{name}': {exc}") from exc
+            raise RuntimeError(
+                f"Math error in raster_calculator expression '{name}': {exc}"
+            ) from exc
 
         result = np.asarray(result, dtype=np.float32)
 
@@ -555,11 +560,8 @@ class FactorLibrary:
 
         return result * valid_mask
 
-# -----------------------------------------------------------------------------
-# Internal Helpers
-# -----------------------------------------------------------------------------
 
-def _get_required_factor(ctx, name):
+def ZZ_get_required_factor(ctx, name):
     """
     Safely retrieves a previously computed factor.
     Provides high-fidelity error messages for dependency/sequence issues.

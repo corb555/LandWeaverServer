@@ -13,12 +13,12 @@ SourceKey = str
 SurfaceKey = str
 FactorKey = str
 
-
 DTYPE_ALIASES = {
     "uint8": np.uint8, "ubyte": np.uint8, "byte": np.uint8, "int16": np.int16, "uint16": np.uint16,
     "int32": np.int32, "uint32": np.uint32, "float32": np.float32, "float": np.float32,
     "float64": np.float64, "double": np.float64,
 }
+
 
 class FileKey(StrEnum):
     """Non-source file keys stored under `cfg['files']`."""
@@ -31,8 +31,8 @@ class FileKey(StrEnum):
 @dataclass(frozen=True, slots=True)
 class SourceRndrSpec:
     halo_px: int
-    #cleanup_type: Optional[str] = None
-    #smoothing_radius: Optional[float] = None
+    # cleanup_type: Optional[str] = None
+    # smoothing_radius: Optional[float] = None
     dtype: Any = "float32"
 
 
@@ -137,7 +137,7 @@ class SurfaceModifierSpec:
 @dataclass(frozen=False, slots=True)
 class RequiredResources:
     """The master manifest produced by scanning the pipeline."""
-    # Physical Sources
+    #  Sources
     sources: Dict[SourceKey, Path]
     files: Set[FileKey]
     factor_inputs: Set[str]

@@ -1,9 +1,11 @@
+import collections
 from dataclasses import dataclass
 from typing import Dict, Optional, Any
 
 import numpy as np
+
 from landweaverserver.render.qml_palette import QmlPalette, _parse_color_attr
-from scipy.ndimage import gaussian_filter
+from landweaverserver.render.utils import optimized_blur
 
 MEDIAN_FILTER_SIZE = 3
 EPSILON = 1e-6
@@ -138,7 +140,7 @@ class ThemeRegistry:
             try:
                 # Build the unified spec containing  Smoothing and Rendering data
                 spec = ThemeRuntimeSpec(
-                    label=label, theme_id=theme_id, rgb=rgb, # Rendering Params
+                    label=label, theme_id=theme_id, rgb=rgb,  # Rendering Params
                     max_opacity=float(cat_cfg.get("max_opacity", 1.0)),
                     blur_px=float(cat_cfg.get("blur_px", 0.0)),
                     noise_amp=float(cat_cfg.get("noise_amp", 0.0)),
@@ -174,17 +176,34 @@ class ThemeRegistry:
                 label in self._name_to_id}
 
     def load_theme_style(self) -> None:
-        """Build dense RGB LUT in worker process."""
+        """Build high-performance LUTs for both Color and Mottle-Shift."""
         if self.lut_rgb is not None:
             return
 
-        lut = np.zeros((LUT_SIZE, 3), dtype=np.uint8)
-        for theme_id, rgb in self._id_to_color.items():
-            if not 0 <= theme_id < LUT_SIZE:
-                raise ValueError(f"Theme ID {theme_id} is outside LUT range 0-{LUT_SIZE - 1}.")
-            lut[theme_id] = rgb
+        # LUT 1: Base Colors
+        self.lut_rgb = np.zeros((256, 3), dtype=np.uint8)
 
-        self.lut_rgb = lut
+        # LUT 2: Mottle Vectors (Pre-multiplied by intensity)
+        # We group these by Noise ID because different themes might use different noises
+        self.lut_shifts_by_noise: Dict[str, np.ndarray] = collections.defaultdict(
+            lambda: np.zeros((256, 3), dtype=np.float32)
+        )
+
+        for theme_id, spec in self._runtime_specs_by_id.items():
+            if not 0 <= theme_id < 256: continue
+
+            # Populate Color
+            self.lut_rgb[theme_id] = spec.rgb
+
+            # Populate Shift Vector for the specific noise this theme uses
+            if spec.surface_noise_id and spec.surface_intensity > 0:
+                baked_vec = np.array(
+                    spec.surface_shift_vector, dtype=np.float32
+                ) * spec.surface_intensity
+                self.lut_shifts_by_noise[spec.surface_noise_id][theme_id] = baked_vec
+
+        # Handle Background (Force 0)
+        self.lut_rgb[BACKGROUND_THEME_ID] = (0, 0, 0)
 
     def build_tile_context(self, theme_ids: np.ndarray) -> ThemeTileContext:
         present_ids = set(np.unique(theme_ids).tolist())
@@ -202,51 +221,40 @@ class ThemeRegistry:
             active_specs.append(spec)
             masks_by_id[theme_id] = (theme_ids == theme_id).astype(np.float32)
 
-        active_specs.sort(key=lambda item: item.theme_id)
+        # xyzzy active_specs.sort(key=lambda item: item.theme_id)
         return ThemeTileContext(
             theme_ids=theme_ids, present_ids=present_ids, active_specs=active_specs,
             masks_by_id=masks_by_id, )
 
-    def get_theme_surface(
-            self, theme_ids: np.ndarray, ctx: Any,
-            tile_ctx: Optional[ThemeTileContext] = None, ) -> np.ndarray:
-
+    def get_theme_surface(self, theme_ids: np.ndarray, ctx: Any, **kwargs) -> np.ndarray:
         if self.lut_rgb is None:
             self.load_theme_style()
 
-        if tile_ctx is None:
-            tile_ctx = self.build_tile_context(theme_ids)
+        indices = theme_ids.astype(np.uint8, copy=False)
 
-        indices = theme_ids.astype(np.uint8)
+        # 1. Base Color Lookup (One single allocation for the result)
         rgb_float = self.lut_rgb[indices].astype(np.float32)
 
-        noise_cache: Dict[str, np.ndarray] = {}
+        # 2. Apply Noise-Groups Channel-Wise
+        for nid, shift_lut in self.lut_shifts_by_noise.items():
+            noise_provider = ctx.noises.get(nid)
+            if not noise_provider: continue
 
-        for spec in tile_ctx.active_specs:
-            if not spec.surface_noise_id or spec.surface_intensity <= 0.0:
-                continue
+            # ns is (H, W) - a direct view of the noise
+            ns = noise_provider.get_noise_signal(
+                int(ctx.window.row_off), int(ctx.window.col_off), indices.shape[0], indices.shape[1]
+            )[..., 0]
 
-            noise = noise_cache.get(spec.surface_noise_id)
-            if noise is None:
-                noise_provider = ctx.noises.get(spec.surface_noise_id)
-                if noise_provider is None:
-                    available = ctx.noises.keys()
-                    raise KeyError(
-                        f"Missing noise provider '{spec.surface_noise_id}' "
-                        f"for theme '{spec.label}'.  Available: {available}"
-                    )
-                noise = np.squeeze(noise_provider.window_noise(ctx.window)).astype(np.float32)
-                noise_cache[spec.surface_noise_id] = noise
+            # Channel-wise math prevents massive float32 allocations
+            for i in range(3):
+                # shift_lut[:, i][indices] is a 2D (H, W) array
+                rgb_float[..., i] += ns * shift_lut[:, i][indices]
 
-            centered_noise = noise - 0.5
-            shift = (centered_noise[..., np.newaxis] * np.asarray(
-                spec.surface_shift_vector, dtype=np.float32
-            ) * spec.surface_intensity)
-            mask_3d = tile_ctx.masks_by_id[spec.theme_id][..., np.newaxis]
-            rgb_float += shift * mask_3d
+        # 3. Final Cleanup
+        if BACKGROUND_THEME_ID != 0:
+            rgb_float[indices == BACKGROUND_THEME_ID] = 0.0
 
-        rgb_float[theme_ids == BACKGROUND_THEME_ID] = 0.0
-        return np.clip(rgb_float, 0.0, 255.0)
+        return rgb_float.clip(0.0, 255.0, out=rgb_float)
 
 
 def refine_signal(mask: np.ndarray, params: Any, ctx: Any, diag_name: str = None) -> np.ndarray:
@@ -262,17 +270,18 @@ def refine_signal(mask: np.ndarray, params: Any, ctx: Any, diag_name: str = None
 
     blur_px = float(get_p("blur_px", 0.0))
     noise_amp = float(get_p("noise_amp", 0.0))
+    noise_atten_power = float(get_p("noise_atten_power", 1.0))
     noise_id = get_p("noise_id", "none")
     contrast = float(get_p("contrast", 1.0))
     max_opacity = float(get_p("max_opacity", 1.0))
+    preserve_zero = bool(get_p("preserve_zero", False))
 
     # 3. EXECUTION STACK
-    # Ensure raw binary 100 doesn't enter as 100.0
     signal = np.clip(mask.astype(np.float32), 0.0, 1.0)
 
     # A. Initial Melt
     if blur_px > 0.0:
-        signal = gaussian_filter(signal, sigma=blur_px)
+        signal = optimized_blur(signal, sigma=blur_px)
 
     # B. Noise Modulation
     if noise_amp > 0.0 and noise_id != "none":
@@ -282,13 +291,22 @@ def refine_signal(mask: np.ndarray, params: Any, ctx: Any, diag_name: str = None
 
             if noise_2d.ndim != 2:
                 raise ValueError(
-                    f"UPSTREAM ERROR: Noise Provider '{noise_id}' returned shape {noise_2d.shape}. "
-                    f"refine_organic_signal requires strictly 2D (H,W) noise."
+                    f"UPSTREAM ERROR: Noise Provider '{noise_id}' returned shape {noise_2d.shape}."
                 )
 
-            # Formula logic
-            low_bound = signal * (1.0 - noise_amp)
-            high_bound = signal  # Bound at the mask edge
+            # --- PRESERVE ZERO LOGIC ---
+            # If preserve_zero is enabled, we scale the intensity of the noise
+            # by the current signal. In the "full" interior (1.0), noise is 100%.
+            # At the vignetted edges (e.g., 0.1), the noise amplitude drops
+            # significantly (e.g., to 0.07), ensuring the edge remains a smooth gradient.
+            effective_noise_amp = noise_amp
+            if preserve_zero:
+                effective_noise_amp = noise_amp * (signal ** noise_atten_power)
+
+            # Formula logic:
+            # The low_bound moves closer to the high_bound (signal) as signal drops.
+            low_bound = signal * (1.0 - effective_noise_amp)
+            high_bound = signal
 
             # Interpolate: signal = low + (noise * delta)
             signal = low_bound + (noise_2d * (high_bound - low_bound))
@@ -296,6 +314,12 @@ def refine_signal(mask: np.ndarray, params: Any, ctx: Any, diag_name: str = None
     # C. Signal Shaping
     if contrast != 1.0:
         signal = np.clip((signal - 0.5) * contrast + 0.5, 0.0, 1.0)
+
+    # Final enforcement: If preserve_zero is true, we multiply by the blurred mask
+    # one last time. This acts as a secondary vignette that ensures any noise
+    # artifacts created near the threshold are "crushed" back to zero.
+    if preserve_zero:
+        signal = signal * np.clip(mask.astype(np.float32), 0.0, 1.0)
 
     final_res = np.clip(signal * max_opacity, 0.0, 1.0)
 

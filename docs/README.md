@@ -1,9 +1,13 @@
 
 # LandWeaver
 
-**LandWeaver** is a programmable spatial compositing and synthesis system for turning raw GIS rasters into refined cartographic output.
+**LandWeaver** is a geospatial compositing system for turning raw GIS rasters into refined cartographic 
+renders.
 
-It is designed for users who want more control than standard GIS styling typically provides, especially when working toward naturalistic, thematic, or presentation-quality maps. LandWeaver combines geospatial raster inputs, computed control masks, procedural texture, and an ordered compositing pipeline to produce results that are smoother, richer, and more visually intentional than conventional raster workflows.
+It is designed for users who want more control than basic GIS styling typically provides, especially 
+when working toward naturalistic, thematic, or presentation-quality maps. LandWeaver combines geospatial 
+raster inputs, computed control masks, procedural texture, and an ordered compositing pipeline to 
+ blend layers, create smooth edges, and add textures and noise.
 
 ![Sample LandWeaver render](https://github.com/corb555/LandWeaverServer/blob/6ace8f2d3b181e9f80a2c418ab9c9b67b1ee5af3/docs/images/grand%20canyon.png)
 
@@ -24,17 +28,18 @@ At a high level, a render works like this:
 1. **Sources**  
    Georeferenced raster inputs such as DEM, precipitation, canopy, lithology, slope, or categorical landcover.
 
-2. **Factors**  
-   Normalized control layers, usually in the range `0.0` to `1.0`, derived from source data. Factors determine where and how strongly an effect should be applied.
+2. **Surfaces**  
+   Render-ready visual layers such as terrain color, forest, snow, rock, or thematic overlays. Surfaces are usually created from raster sources using ramps, noise, smoothing, and texture modifiers.
 
-3. **Surfaces**  
-   Render-ready visual layers such as terrain color, forest, snow, rock, or thematic overlays. Surfaces are usually created from raster sources using ramps, theme styling, and texture modifiers.
+3. **Factors**  
+   Factors determine where and how strongly an effect should be applied. They are typically used to control
+blending between two layers. They are usually in the range `0.0` to `1.0`, derived from source data. 
 
 4. **Blend Operations**  
-   Operations that combine factors and surfaces into visual results. For example, a canopy factor can blend meadow and forest surfaces based on vegetation density.
+   Blend operations  combine factors and surfaces into visual results. For example, a canopy factor can blend a meadow surface and a forest surface based on a tree height factor.
 
 5. **Pipeline**  
-   The ordered execution sequence that builds the final image step by step.
+   The pipeline defines all the steps that build the final raster.
 
 ```mermaid
 flowchart LR
@@ -72,11 +77,12 @@ LandWeaver is driven by a user-configured compositing sequence.
 
 * **Flexible raster inputs** — ingest geospatial rasters such as DEM, precipitation, canopy, or lithology
 * **Logical blending** — combine layers using operations such as `lerp_surfaces`, `alpha_over`, and `lerp_buffers`
-* **Programmable shading** — apply hillshade with highlight and shadow protection to preserve vibrancy and clean midtones
+* **Controlled shading** — apply hillshade with highlight and shadow protection to preserve vibrancy 
+and clean midtones
 
 ### Factor System
 
-Factors are the control signals that drive the render. They transform physical source data into reusable masks and shaping layers. 
+Factors are the control signals that drive the render. They transform source data into reusable masks and shaping layers. 
 
 * **Apparent elevation logic** — displace or reshape environmental transitions to avoid rigid, artificial boundaries
 * **Sensitivity-weighted shaping** — adjust scale, bias, contrast, and gamma-like sensitivity to control thresholds and softness
@@ -86,10 +92,11 @@ Factors are the control signals that drive the render. They transform physical s
 
 Surfaces are the visual materials of the map, synthesized as RGB output layers. 
 
-* **Ramp synthesis in physical units** — sample color ramps directly using physical values such as elevation in meters
+* **Ramp based surfaces** — create surfaces from color ramps directly using  values such as elevation 
 * **Hue perturbation and texture** — add controlled variation, grit, and tactile surface character
 * **Geometry cleanup** — transform blocky categorical or coarse raster inputs into smoother visual forms
-* **Naturalization** — inject procedural variation to create patchiness, clumping, and more organic spatial texture
+* **Naturalization** — inject procedural variation to create patchiness, clumping, and more organic 
+spatial texture
 
 ### Noise Library
 
@@ -99,9 +106,12 @@ LandWeaver includes a configurable multi-scale noise system for building organic
 * **Anisotropic stretch** — create directional patterns for water, sediment, or wind-shaped surfaces
 * **Iterative tuning** — calibrate texture response to match a desired geological or biological look
 
-### Themed and Categorical Sources
+### Themed / Categorical Sources
 
-LandWeaver supports both continuous rasters and discrete thematic rasters. For categorical sources, pixel values represent class IDs rather than continuous measurements, so they must be handled differently from elevation or precipitation. This is especially important when converting blocky classified rasters into smooth, visually coherent map surfaces. 
+LandWeaver supports both continuous rasters and discrete thematic rasters to create surfaces. For categorical sources, pixel 
+values represent class IDs rather than continuous measurements, so they must be handled differently 
+from elevation or precipitation. This is especially important when converting blocky classified rasters 
+into smooth, visually coherent map surfaces. 
 
 ## Performance and Architecture
 

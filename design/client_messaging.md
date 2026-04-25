@@ -35,7 +35,7 @@ The Client shall act as the client.
 
 The transport shall be local-machine only.
 
-The Daemon shall open the socket: /tmp/thematic_render.sock
+The Daemon shall open the socket: as specified
 
 ## Message Model
 
@@ -44,17 +44,20 @@ sent over the messaging channel.
 
 The messaging channel shall be used for:
 
-* render requests
-* progress or state updates
-* completion notifications
-* error notifications
-* optional cancel or shutdown commands
+Client messages:
+* render request
+* cancel job
+
+Server messages:
+* progress or state update
+* completion notification
+* error notification
 
 ## Encoding and Framing
 
 Messages shall be encoded as UTF-8 JSON.
 
-Each message shall be framed as a single newline-terminated JSON object.
+Each message shall be framed as NDJSON (a single newline-terminated JSON object).
 
 Each side shall treat one newline-terminated JSON object as one complete message.
 
@@ -64,10 +67,10 @@ All messages will include a message type (msg)
 
 ## Connection Model
 
-The Client shall establish a client connection to the Daemon when the View tab needs to issue or receive
+The Client shall establish a client connection to the Daemon when it needs to issue or receive
 render-related messages.
 
-The Client may keep the connection open across multiple requests.
+The Client must close the connection after each request.
 
 The Daemon shall be able to accept a connection from the Client and remain available for repeated
 request/response cycles.
@@ -76,82 +79,66 @@ If the connection is lost, the Client shall detect the disconnect and report tha
 
 ## Request–Response Pattern
 
-The Client shall send a render request message when the user clicks **Build**.
+The Client shall send a render request message when the user requests a render.
 
-The Daemon shall respond asynchronously. It is not required to complete the request before acknowledging receipt of
-the message at the transport level.
+The Daemon shall respond asynchronously. 
 
-## Request Identity
+### _Terminal Response_
 
-Each render request shall include a `job_id`.
-
-The Daemon shall include the same `job_id` in every response associated with that request.
-
-This requirement applies to:
-
-* progress messages
-* completion messages
-* error messages
-* any future cancellation acknowledgments
-
-The `job_id` allows the Client to match responses to the correct request and safely ignore stale messages.
-
-### Terminal Response
-
-For each render request, the Daemon must eventually send exactly one terminal response:
+For each render request, the Daemon must eventually send exactly one _Terminal Response_:
 
 * `complete`
 * `error` with Severity other than SEV_WARNING  (2)
-* `cancelled`, if cancellation is later supported
-
-Any message for that `job_id` received after a Terminal Response should be ignored.
+* `cancelled`
 
 ### Progress / Status
 
-Optional intermediate progress or state messages may be sent before the terminal response.
+Optional intermediate progress or state messages may be sent before the _Terminal Response_.
 
 ## Message Types
 
+> ALL PATHS ARE RELATIVE TO THE SERVER WORKING DIR. ABSOLUTE PATHS ARE REJECTED
+> The server will reject any client message other than: `render_request`  
+
 ### Render Request
 
-The Client shall send a `start_render` command to request a render.
+The Client shall send a `render_request` command to request a render.
 
 The request shall include a `params` object containing the operational settings needed for that render.
 
 Required params entries:
 
+* `output_suffix`
+* `prefix`
 * `percent`
 * `row`
 * `col`
-* `config_path`
-* `prefix`
-* `build_dir`
-* `output_file`
+
 
 Example:
 
 ```json
 {
-  "msg": "job_request",
-  "job_id": "21",
+  "msg": "render_request",
+  "job_id": 12,
   "params": {
-     "percent": 0.1,
-     "row": 0.5,
-     "col": 0.5,
-     "config_path": "biome.yml",
-     "prefix": "Yosemite",
-     "build_dir": "xyz",
-     "output_file": "yosemite_relief.tif"
+    "percent": 0.2,
+    "row": 0.1,
+    "col": 0.9,
+    "prefix": "Sedona",
+    "output_suffix": "_biome"
   }
 }
 ```
 
 ### Progress Message
 
-The Daemon may periodically send progress status messages while work is in progress.
+The Daemon _may_ periodically send progress status messages while work is in progress.
 
-A progress message may include human-readable status text.
-It must include a progress field with 0 - 100.00 progress,  including decimal precision.
+A progress message _may_ include human-readable status text.
+It _must_ include the `progress` field with 0 - 100.00 progress,  including decimal precision.
+The client does not need to process progress messages.
+
 Example:
 
 ```json
@@ -167,20 +154,21 @@ Example:
 
 When rendering succeeds, the Daemon shall send a `complete` message.
 
-The completion message shall include the output raster path.
+The completion message shall include the relative output raster path.
 
 Example:
 
 ```json
 {
-    "msg": "complete", "job_id":"34",
+    "msg": "complete", 
+    "job_id":"34",
     "path": "xxx/zzz.tif"
 }
 ```
 
 ### Error Message
 
-If rendering fails, the Daemon shall send an `error` message.
+The Daemon shall send an `error` message for errors during the render.
 
 The error message shall include a human-readable description and a severity.
 
@@ -193,8 +181,23 @@ Example:
 
 ```json
 {
-    "msg": "error", "job_id": "41", "severity": 0,
+    "msg": "error", 
+    "job_id": "41", 
+    "severity": 0,
     "message": "render pipeline Crash: XYZ"
+}
+```
+
+#### Server Queue
+When a request is sent the Daemon _may_ respond with a Warning indicating the request is being queued rather being
+immediately started.
+
+Example:
+
+```json
+{
+    "msg": "error", "job_id": "41", "severity": 2,
+    "message": "Request queued"
 }
 ```
 
@@ -203,11 +206,9 @@ Example:
 The Client shall:
 
 * connect to the Daemon over `QLocalSocket`
-* send newline-delimited JSON requests
-* parse newline-delimited JSON responses
+* send NDJSON requests
+* parse NDJSON responses
 * include a `job_id` in every render request
-* disable or otherwise guard the Build action while a request is active, unless overlapping requests are intentionally
-  supported
 * treat `complete` and `error` as terminal states for the active request
 * ignore messages whose `job_id` does not match the active request
 * display an error if the Daemon cannot be reached
@@ -222,28 +223,49 @@ The Client shall remain responsive while waiting for Daemon messages.
 The Daemon shall:
 
 * listen for Client connections using `socket.AF_UNIX` on the above specified socket name.
-* accept newline-delimited JSON requests
-* validate incoming messages before acting on them
-* reject malformed or incomplete requests with an `error` response when possible
+* accept NDJSON requests
+* validate incoming messages before acting on them (see Validation)
+* reject malformed  requests with an `error` response where specified
 * include the originating `job_id` in every response associated with that request
 * send exactly one terminal response for each accepted `start_render` request
-* send the output TIFF path in the completion response
+* send the output  path in the completion response
 * send an error response if the render cannot be started or cannot complete
 * remain running across multiple requests unless explicitly shut down
 
-## Validation 
+## Message Validation 
 
-The Daemon performs some validation on the incoming `start_render` messages before starting work.
+The Daemon validates each incoming Client message immediately upon receipt.
 
-At minimum, it  validates:
+A message is accepted only if all of the following are true:
 
-* that `msg` is recognized
-* that `job_id` is present
-* that `params` is present
-* that required parameter fields are present
-* that parameter values are of usable type and range
+the message length is no greater than MAX_MSG_BYTES (1000 bytes)
+the message parses as valid JSON using json.loads(line)
+the parsed JSON value is a dict
+the msg field is exactly "render_request"
+job_id is a digit-only string with a maximum length of 11 characters
+the message passes Cerberus schema validation:
+all required fields are present
+no unexpected fields are present
+all values are of the expected type and within allowed ranges
+region matches the allowed pattern: alphanumeric plus '_'
 
-If validation fails, the Daemon  returns an `error` response and does not start the render.
+If validation fails, the message is dropped.
+
+No error response is sent for malformed or invalid protocol messages.
+An error response is sent only when the message is structurally valid but one or more user parameters are invalid, such as region, percent, row, or col.
+
+```json
+{
+  "msg": "render_request",
+  "job_id": "12",
+  "params": {
+    "percent": 0.2,
+    "row": 0.1,
+    "col": 0.9,
+    "region": "Sedona"
+  }
+}
+```
 
 ## Ordering Requirements
 
@@ -258,8 +280,7 @@ If the Client cannot connect to the Daemon, it shall report the connection failu
 
 If the Daemon disconnects unexpectedly while a request is active, the Client shall treat the request as failed.
 
-If the Daemon receives malformed JSON, it may close the connection or send an error response. The preferred behavior is
-to send an error response when the message boundary is intact and the request can still be identified.
+If the Daemon receives malformed JSON, it may close the connection or send an error response. 
 
 If either side receives an unknown message type, it shall treat that as a protocol error.
 
@@ -275,7 +296,7 @@ A timeout shall be treated as a failed request unless a progress policy explicit
 ## Concurrency Policy
 
 If the Client sends a new `start_render` request while another is still active, the Daemon will queue the request and
-start it when the current request finishes.
+start it when the current request finishes.  The Daemon may respond with a Warning message that the request is queued.
 
 
 ## Security and Trust Boundary

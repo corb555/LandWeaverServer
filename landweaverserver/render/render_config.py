@@ -5,15 +5,16 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import (Any, Tuple, Iterable, Set, Dict, List)
+from typing import (Any, Tuple, Iterable, Set, Dict, List, Optional)
 
 import numpy as np
 from YMLEditor.yaml_reader import ConfigLoader
 
-from landweaverserver.common.keys import SourceKey, FileKey, NoiseSpec, RequiredResources, _BlendSpec, SurfaceSpec, \
-    FactorSpec, PipelineRequirements, SurfaceModifierSpec, SurfaceKey, SourceRndrSpec, DTYPE_ALIASES
+from landweaverserver.common.keys import SourceKey, FileKey, NoiseSpec, RequiredResources, \
+    _BlendSpec, SurfaceSpec, FactorSpec, PipelineRequirements, SurfaceModifierSpec, SurfaceKey, \
+    SourceRndrSpec, DTYPE_ALIASES
 from landweaverserver.render.schema import RENDER_SCHEMA
-from landweaverserver.render.utils import  GenMarkdown
+from landweaverserver.render.utils import GenMarkdown, validate_path
 
 
 # render_config.py
@@ -39,16 +40,14 @@ class RenderConfig:
 
     @classmethod
     def load(cls, config_path: Path) -> "RenderConfig":
-        if not config_path.exists():
-            raise FileNotFoundError(f"Biome config not found at: {config_path}")
-
+        validate_path(config_path)
         loader = ConfigLoader(RENDER_SCHEMA)
         try:
             defs = loader.read(config_file=config_path)
         except Exception as e:
-            raise ValueError(f"YAML Syntax Error in {config_path.name}: {e}")
+            raise ValueError(f"YAML Syntax Error for config file '{config_path.name}': {e}")
 
-        print(f"RenderConfig LOADING {config_path}")
+        print(f"[RenderConfig] LOADING {config_path}")
 
         context = "initialization"
         current_item = "n/a"
@@ -85,12 +84,7 @@ class RenderConfig:
                 current_item = dname
                 dkey = to_enum(SourceKey, dname)
                 source_specs[dkey] = SourceRndrSpec(
-                    dtype=data.get("dtype", "float32"), halo_px=int(data.get("halo_px", 64)),
-                    #cleanup_type=data.get("cleanup_type"),
-                    #smoothing_radius=float(data.get("smoothing_radius", 0)) if data.get(
-                    #    "smoothing_radius"
-                    #) else None
-                )
+                    dtype=data.get("dtype", "float32"), halo_px=int(data.get("halo_px", 64)), )
 
             # 4. factors
             context = "factors"
@@ -101,8 +95,7 @@ class RenderConfig:
                 factors.append(
                     FactorSpec(
                         name=fname, factor_builder=data["factor_builder"],
-                        sources=tuple(d for d in data["sources"]),
-                        noise_id=data.get("noise_id"),
+                        sources=tuple(d for d in data["sources"]), noise_id=data.get("noise_id"),
                         required_factors=tuple(data.get("required_factors", [])),
                         params=data.get("params", {}), desc=data.get("desc", "")
                     )
@@ -121,19 +114,17 @@ class RenderConfig:
                 surfaces.append(
                     SurfaceSpec(
                         key=to_enum(SurfaceKey, sname), source=to_enum(SourceKey, data["source"]),
-                        input_factor=data.get("input_factor"),
-                        required_factors=tuple(req_f),
+                        input_factor=data.get("input_factor"), required_factors=tuple(req_f),
                         surface_builder=data.get("surface_builder"),
-                        modifiers=data.get("modifiers", []),
-                        files=tuple(data.get("files", [])),
+                        modifiers=data.get("modifiers", []), files=tuple(data.get("files", [])),
                         desc=data.get("desc", "")
                     )
                 )
 
-            # 6. theme_render
+            #  theme_render
             theme_render = defs.get("theme_render", {})
 
-            # 6. theme_smoothing_specs
+            #  theme_smoothing_specs
             theme_smoothing_specs = defs.get("theme_smoothing_specs", {})
 
             # 6. pipeline
@@ -170,26 +161,26 @@ class RenderConfig:
         except Exception as e:
             raise ValueError(f"Logic error in [{context}] item '{current_item}': {e}")
 
-    def resolve_paths(self, prefix: str, build_dir: Path, output_file: str) -> None:
-        """Finalizes file dictionary and validates that all inputs exist on disk."""
+    def resolve_paths(
+            self, prefix: str, config_dir: Path, build_dir: Path, output_path: str
+    ) -> None:
+        """Finalizes file dictionary from config sections and validates that all inputs exist on
+        disk."""
         resolved_files = {}
         missing_files = []
 
-        # 1. Standard Files (Direct paths like QML)
-        # These are established first as the 'base' keys.
+        # 1. "files" section: Config Assets (QML, Ramp TXT)
         for k, v in self.raw_defs.get("files", {}).items():
-            p = Path(v).expanduser()
+            # Join and expand: Handles relative filenames or absolute paths
+            p = Path(config_dir, v).expanduser().resolve()
+
             if not p.exists():
-                missing_files.append(f"Standard File [{k}]: {p}")
+                missing_files.append(f"Config File [{k}]: {p}")
             resolved_files[k] = p
 
-        # 2. Prefixed Files (Input TIFFs like _DEM.tif)
+        # 2.  "sources" files get the prefix and build dir added for convenience
         for k, v in self.raw_defs.get("sources", {}).items():
-            # The 'output' key is handled separately in step 3
-            if k == "output":
-                continue
-
-            # --- THE COLLISION CHECK ---
+            #  ensure 'files' and 'sources' don't have same key
             if k in resolved_files:
                 raise ValueError(
                     f"❌ Configuration Error: Duplicate file key '{k}' detected. "
@@ -197,22 +188,21 @@ class RenderConfig:
                     f"Standard path: {resolved_files[k]} | Prefixed path: {v}"
                 )
 
+            # Add build_dir and prefix
             p = (build_dir / f"{prefix}{v}").resolve()
             if not p.exists():
                 missing_files.append(f"{k}: {p}")
             resolved_files[k] = p
 
-        # 3. Output Destination (Must not exist, but parent must)
-        out_path = Path(output_file)
-        if not out_path.is_absolute():
-            out_path = build_dir / out_path
+        # 3. Output Destination
+        out_path = Path(output_path)
         out_path = out_path.resolve()
 
         if not out_path.parent.exists():
             try:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
             except Exception as e:
-                missing_files.append(f"Output Directory (uncreatable): {out_path.parent} - {e}")
+                missing_files.append(f"Output Directory (cannot create): {out_path.parent} - {e}")
 
         resolved_files["output"] = out_path
 
@@ -242,7 +232,7 @@ class RenderConfig:
         """
         Returns the dictionary of thematic smoothing rules (precedence, radius, weight).
         """
-        # 1. Try to pull from the 'theme_smoothing_specs' block in biome.yml
+        # 1. Try to pull from the 'theme_smoothing_specs' block in land weaver yml
         return self.raw_defs.get("theme_smoothing_specs")
 
     def get_max_halo(self) -> int:
@@ -251,22 +241,28 @@ class RenderConfig:
                  getattr(spec, "halo_px", None) is not None]
         return max(halos, default=0)
 
+    def get_surface_spec(self, key: str) -> Optional[SurfaceSpec]:
+        """Pure string lookup for dynamic user-defined surfaces."""
+        for s in self.surfaces:
+            if s.key == key:
+                return s
+        return None
+
     def path(self, key: str) -> Path:
-        """Returns the absolute Path for a file key."""
+        """
+        Returns the  Path for a file key.
+        Can return None if not found
+        """
         p = self.files.get(key)
-        if not p:
-            # Note:  let the app handle the failure if a file is missing
-            return None
         return p
 
     def get_global(self, key: str, default: Any = None) -> Any:
-        """Access top-level project settings like 'seed'."""
+        """Access top-level project settings """
         return self.raw_defs.get(key, default)
 
     def get_hashes(self) -> Dict[str, str]:
         """
-        Declarative hash generation.
-        Precedence: Top-level YAML sections override file-freshness checks.
+        hash generation.
         """
         hash_schema = {
             "topology": ["pipeline", "logic", "source_specs"],
@@ -286,9 +282,9 @@ class RenderConfig:
                     bucket_data[k] = self.raw_defs[k]
                     continue
 
-                # TODO Remove hard-code of theme_qml and explicitly get from YAML config
+                # TODO Remove hard-code of theme_qml and  get from YAML config
                 # 2. FALLBACK: If not in YAML, check if the key refers
-                # to a physical file. If so, capture its modification time.
+                # to a  file. If so, capture its modification time.
                 if k == "theme_qml":
                     file_path = self.path(k)
                     bucket_data[f"{k}_mtime"] = file_path.stat().st_mtime
@@ -373,9 +369,10 @@ def _require_blend_ops(pipeline_list: list[_BlendSpec], required_ops: set[str]) 
             "Enabled steps:\n  - " + "\n  - ".join(pretty_enabled) + "\n"
                                                                      "Your pipeline must include "
                                                                      "an enabled "
-                                                                     "blend_op='create_buffer' step "
+                                                                     "blend_op='create_buffer' "
+                                                                     "step "
                                                                      "before "
-                                                                     "blend_op='write_output'.\n"
+                                                                     "blend_op='output_buffer'.\n"
         )
 
 
@@ -428,7 +425,7 @@ def derive_resources(*, render_cfg: RenderConfig) -> RequiredResources:
     noise_profiles = {nid: render_cfg.noises[nid] for nid in requested_noise_ids if
                       nid in render_cfg.noises}
 
-    # 5. Resolve Physical Paths
+    # 5. Resolve  Paths
     resolved_sources = {dkey: render_cfg.path(dkey) for dkey in req_sources}
 
     # 6. Determine the Geometry Anchor
@@ -486,7 +483,7 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
                 if sname not in sim_surfaces and sname not in sim_buffers:
                     add_warning(
                         i, f"⚠️ **render Config error:** Surface/Buffer '{sname}' not found."
-                        )
+                    )
 
         # CHECK 2: Factor Dependency
         if step.factor:
@@ -501,7 +498,7 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
                 add_warning(
                     i, f"⚠️ **render Config error:** Buffer '{step.buffer}' used before "
                        f"'create_buffer'. Available = '{sim_buffers}'"
-                    )
+                )
 
         # --- UPDATE SIMULATED STATE ---
         if step.blend_op == "create_buffer":
@@ -543,13 +540,12 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
     # --- SECTION 2: RESOURCE REGISTRY ---
     md.header("2. Global Resource Registry", 2)
 
-    # Physical Sources (from source_specs)
+    #  Sources (from source_specs)
     md.header("Input Sources", 3)
     md.tbl_hdr("Source Key", "Halo", "Cleanup")
     for dkey in sorted(list(ctx.eng_resources.pool_map.keys())):
         ds = cfg.get_spec(dkey)
-        d_name = get_exact_val(dkey)
-        #md.tbl_row(f"`{d_name}`", f"{ds.halo_px}px", "")
+        d_name = get_exact_val(dkey)  # md.tbl_row(f"`{d_name}`", f"{ds.halo_px}px", "")
 
     # Noise Profiles
     md.header("Procedural Noise Profiles", 3)
@@ -597,7 +593,8 @@ def validate_noise_integrity(render_cfg: Any) -> list[str]:
     for mid, mprof in modifiers.items():
         if mprof.noise_id and mprof.noise_id not in valid_noises:
             errors.append(
-                f"❌ **Modifier Error:** Profile `{mid}` references unknown noise id `{mprof.noise_id}`"
+                f"❌ **Modifier Error:** Profile `{mid}` references unknown noise id `"
+                f"{mprof.noise_id}`"
             )
 
     # 3. Check Factor Engine -> Noise

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, TypeVar
 
-from landweaverserver.pipeline.engine_resources import JobContextStore
+from landweaverserver.pipeline.job_context import JobContextStore
 
 
 class HasJobId(Protocol):
@@ -46,48 +46,38 @@ def sync_ctx_for_packet(
     """
     Synchronize local worker context against the authoritative SHM job header.
     """
-    shm_job_id = shm_store.get_job_id()
+    # Get currently active job_id from shmem
+    active_job_id = shm_store.get_job_id()
 
-    # --- RULE 0: Global State Check ---
-    # If SHM says we are in a non-active state (Idle=-1, Cancel=-2, Shutdown=-3),
-    # we must immediately stop processing and release resources.
+    # ---  0: Global State Check ---
+    # If  job_id is for a non-active state (Idle=-1, Cancel=-2, Shutdown=-3),
+    #   stop processing and release resources.
     try:
-        # Convert to int to check for negative flags
-        state_val = int(shm_job_id)
-        if state_val < 0:
+        if int(active_job_id) < 0:
             if ctx is not None:
-                print(f"🛑 [{err_prefix}] SHM State {state_val} detected. Closing local resources.")
+                print(
+                    f"🛑 [{err_prefix}] SHM State {active_job_id} detected. Closing local "
+                    f"resources."
+                )
                 ctx.close_local_resources()
             return None
     except (ValueError, TypeError):
-        # shm_job_id is a valid string ID (e.g., '36'), proceed normally
         pass
 
-    # --- RULE 1: Stale Packet Check ---
-    if packet_job_id != shm_job_id:
-        # Packet is from an old job or a different job entirely
+    # ---  1: Packet is for a stale job, ignore  ---
+    if packet_job_id != active_job_id:
+        # Packet is from an old job or different job
         return None
 
-    # --- RULE 2: Context Loading / Reloading ---
-    if ctx is None or ctx.job_id != shm_job_id:
+    # ---  2: We have a new job if our context doesnt match global
+    if ctx is None or ctx.job_id != active_job_id:
         if ctx is not None:
             ctx.close_local_resources()
 
         # Load the new context from SHM
         ctx = load_ctx(packet_job_id, shm_store)
 
-        # --- THE SAFETY CHECK ---
-        # Before opening files (Rasterio), ensure we didn't just
-        # get cancelled while we were loading the context.
-        final_check_id = shm_store.get_job_id()
-        try:
-            if int(final_check_id) < 0:
-                ctx.close_local_resources()
-                return None
-        except (ValueError, TypeError):
-            pass
-
-        # Now safe to hit the disk/GDAL
+        # Load resources
         ctx.open_local_resources()
 
     return ctx

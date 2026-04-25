@@ -1,18 +1,18 @@
 import hashlib
 from pathlib import Path
 import traceback
-from typing import Dict, Any, Optional, Iterable, Final
+from typing import Dict, Any, Optional, Iterable, Final, Callable
 
 import numpy as np
 from rasterio.windows import Window
-from scipy.interpolate import interp1d
 
-from landweaverserver.common.keys import RequiredResources, SurfaceKey, FileKey, SourceKey
+from landweaverserver.common.keys import RequiredResources, SurfaceKey, SourceKey
 from landweaverserver.render.color_config import ColorConfig
 from landweaverserver.render.color_ramp_hsv import get_ramp_from_yml
-from landweaverserver.render.noise_library import NoiseLibrary
+from landweaverserver.render.noise_engine import NoiseEngine
 from landweaverserver.render.render_config import RenderConfig
-from landweaverserver.render.surface_library import SURFACE_PROVIDER_REGISTRY, MODIFIER_REGISTRY, SurfaceContext
+from landweaverserver.render.surface_library import SURFACE_PROVIDER_REGISTRY, MODIFIER_REGISTRY, \
+    SurfaceContext
 
 # surface_engine.py
 EXPECTED_BANDS = 3
@@ -37,14 +37,47 @@ def strip_alpha_or_fail(colors: np.ndarray, *, context: str) -> np.ndarray:
     return colors[:, :3]
 
 
+class FastRamp:
+    def __init__(self, x_coords: np.ndarray, colors: np.ndarray, lut_size: int = 1024):
+        # 1. Store domain for normalization (needed to map meters to LUT index)
+        self.x = x_coords
+        self.u_min = float(x_coords[0])
+        self.u_max = float(x_coords[-1])
+        self.range = self.u_max - self.u_min if self.u_max != self.u_min else 1.0
+
+        # 2. BAKE THE LUT: Use Scipy ONCE right now to create the fast array
+        from scipy.interpolate import interp1d
+        f_temp = interp1d(x_coords, colors, axis=0, fill_value="extrapolate", kind="linear")
+
+        # Create 1024 points covering the range from u_min to u_max
+        lut_x = np.linspace(self.u_min, self.u_max, lut_size)
+        self.lut = f_temp(lut_x).clip(0, 255).astype(np.uint8)
+        self.lut_size_m1 = lut_size - 1
+
+    def __call__(self, data: np.ndarray) -> np.ndarray:
+        # 1. Map input (e.g., meters) to 0.0-1.0 range
+        t = (data - self.u_min) / self.range
+
+        # 2. Map 0.0-1.0 to integer indices [0 ... 1023]
+        indices = (t * self.lut_size_m1).astype(np.int32)
+
+        # 3. Clip ensures we handle values outside the original elevation range
+        np.clip(indices, 0, self.lut_size_m1, out=indices)
+
+        # 4. Near-instant memory lookup
+        return np.take(self.lut, indices, axis=0)
+
+
 class SurfaceEngine:
     def __init__(self, cfg: RenderConfig):
         self.cfg = cfg
         self.target_shape = None
 
-        # Runtime cache for scipy interpolators
-        self.surfaces: Dict[SurfaceKey, interp1d] = {}
-        self.ramp_files: Dict[str, Path] = {}
+        # Runtime registry of surface generators (Ramps, Themes, etc.)
+        # Logic: Input(2D Data) -> Output(3D RGB)
+        self.surfaces: Dict[SurfaceKey, Callable[[np.ndarray], np.ndarray]] = {}
+        self.ramp_paths: Dict[str, Path] = {}
+        self._modifier_cache: Dict[str, np.ndarray] = {}
 
         # Load registry from settings
         self.spec_registry = {s.key: s for s in cfg.surfaces}
@@ -55,12 +88,11 @@ class SurfaceEngine:
         for skey in self.spec_registry.keys():
             seed_bytes = skey.encode('utf-8')
             stable_hash = hashlib.md5(seed_bytes).hexdigest()
-            # Convert to an int and store it
             self._offset_cache[skey] = int(stable_hash[:8], 16) % 1000
 
-    def generate_surface_blocks(
+    def generate_surfaces(
             self, data_2d: dict, masks_2d: dict, factors_2d: dict, style_engine: Any,
-            surface_inputs: Iterable[SurfaceKey], noises: NoiseLibrary, window: Window,
+            surface_inputs: Iterable[SurfaceKey], noises: NoiseEngine, window: Window,
             anchor_key: SourceKey
     ) -> Dict[SurfaceKey, np.ndarray]:
         """
@@ -122,125 +154,188 @@ class SurfaceEngine:
 
         return rendered_surfaces
 
-    def _apply_modifiers(
-            self, srf_key: SurfaceKey, spec: Any, img_block: np.ndarray, noises: NoiseLibrary,
-            window: Window
-    ) -> np.ndarray:
+    @staticmethod
+    def get_ramp_paths(cfg: 'RenderConfig', resources: 'RequiredResources') -> Dict[str, Path]:
         """
-        Applies a sequence of transformations to a single RGB block.
+        RESOLVER: Dynamically maps surface names to  files by
+        inspecting the ramps_yml defined in the config.
         """
-        for mod_cfg in spec.modifiers:
-            mod_id = mod_cfg.get("effect")
-            profile_id = mod_cfg.get("mod_profile")
+        paths: Dict[str, Path] = {}
 
-                        # 1. VALIDATE MODIFIER FUNCTION
-            mod_fn = MODIFIER_REGISTRY.get(mod_id)
-            if not mod_fn:
-                available = ", ".join(sorted(MODIFIER_REGISTRY.keys()))
-                raise ValueError(
-                    f"Surface Engine Error: Surface '{srf_key}' requested unknown effect '{mod_id}'.\n"
-                    f"   Check 'modifiers:' in your YAML for typos.\n"
-                    f"   Available effects: [{available}]"
-                )
+        # 1. Load the secondary YAML (biome_ramps.yml)
+        # FileKey.RAMPS_YML usually maps to the string "ramps_yml"
+        ramps_cfg_path = cfg.path("ramps_yml")
+        if not ramps_cfg_path or not ramps_cfg_path.exists():
+            return {}  # Fallback or raise error
 
-            # 2. VALIDATE MODIFIER PROFILE
-            profile = self.cfg.modifiers.get(profile_id)
-            if not profile:
-                available = ", ".join(sorted(self.cfg.modifiers.keys()))
-                raise ValueError(
-                    f"Surface Engine Error: Surface '{srf_key}' requested profile '{profile_id}' for effect '{mod_id}', "
-                    f"but it is missing from 'modifier_profiles:'.\n"
-                    f"   Available profiles: [{available}]"
-                )
+        import yaml
+        with open(ramps_cfg_path, 'r') as f:
+            ramps_data = yaml.safe_load(f).get("RAMPS", {})
 
-            # 1. FETCH NOISE
-            noise_provider = noises.get(profile.noise_id)
-            offset = self._offset_cache.get(srf_key, 0)
-            noise_2d = noise_provider.window_noise(window, row_off=offset, col_off=offset)
+        def resolve_to_physical_path(skey: str) -> Optional[Path]:
+            """Helper to find the .txt path for a given key."""
+            # Look up the key in the biome_ramps.yml data
+            entry = ramps_data.get(skey)
+            if not entry or entry.get("mode") != "file":
+                return None
 
-            # 2. POLICE CONTRACT: Signal Zone (2D)
-            if noise_2d.ndim != 2:
-                raise ValueError(
-                    f"Surface Engine: Noise provider '{profile.noise_id}' for surface '{srf_key}' "
-                    f"returned shape {noise_2d.shape}. Expected strictly 2D (H,W)."
-                )
+            # Get the filename (e.g., 'arid_base_color_ramp.txt')
+            filename = entry.get("file")
+            if not filename:
+                return None
 
-            # 3. PREPARE FOR VISUAL ZONE (3D Broadcasting)
-            # We explicitly add the axis here so the Library can multiply (H,W,1) * (3,)
-            noise_rgb = noise_2d[..., np.newaxis]
+            # Use the directory of the ramps_yml to resolve the relative .txt path
+            return ramps_cfg_path.parent / filename
 
-            # 4. EXECUTE LIBRARY FUNCTION
-            # img_block is (H,W,3), noise_rgb is (H,W,1)
-            img_block = mod_fn(img_block, noise_rgb, profile)
+        # 2. Resolve Primary Pivot (Fallback)
+        primary_path = resolve_to_physical_path(resources.primary_surface)
 
-        return img_block
+        # 3. Resolve every required input
+        for skey in resources.surface_inputs:
+            spec = cfg.get_surface_spec(skey)
+            if spec is None or spec.surface_builder != "ramp":
+                continue
 
-    def load_surface_ramps(self, resources: RequiredResources, output_dir: Optional[str] = None):
-        """Initializes interpolators for all ramp-based surfaces."""
-        out_dir = Path(output_dir) if output_dir else self._default_ramp_output_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
+            # Check for explicit entry in the ramps YAML
+            explicit_path = resolve_to_physical_path(skey)
 
-        # Clear previous state
-        self.ramp_files.clear()
+            # Inheritance logic
+            final_path = explicit_path if explicit_path else primary_path
+
+            if final_path:
+                paths[skey] = final_path
+
+        return paths
+
+    def load_surface_ramps(self, resources: RequiredResources):
+        """
+        LOADER:  reads the resolved paths and bakes LUTs.
+        """
+        # 1. Get the Map (String -> Path)
+        ramp_map = self.get_ramp_paths(self.cfg, resources)
+
+        self.ramp_paths.clear()
         self.surfaces.clear()
 
-        # print("🔓 Initializing Surface Ramps...")
+        # 2. Process every found ramp
+        for skey, path in ramp_map.items():
+            if not path.exists():
+                raise FileNotFoundError(f"Ramp file for '{skey}' not found at {path}")
 
-        ramps_yml_path = self.cfg.path(FileKey.RAMPS_YML)
+            z, c = ColorConfig.parse_ramp(str(path))
+            c_rgb = strip_alpha_or_fail(c, context=f"surface ramp {skey}")
 
-        # 2. Process Primary Pivot first (derived ramps depend on this)
-        primary_path = None
-        if resources.primary_surface:
-            self._load_and_interpolate(resources.primary_surface, None, ramps_yml_path, out_dir)
-            primary_path = self.ramp_files.get(resources.primary_surface)
+            # self.surfaces is now Dict[str, FastRamp]
+            self.surfaces[skey] = FastRamp(z, c_rgb)
+            self.ramp_paths[skey] = path
 
-        # 3. Load all required external surfaces
+        # 3. CRITICAL: Validation
+        # If a surface is a 'ramp' but didn't get a path, we MUST fail here.
         for skey in resources.surface_inputs:
-            if skey == resources.primary_surface:
-                continue
-
-            spec = self.spec_registry.get(skey)
-            if spec is None:
-                available = list(self.spec_registry.keys())
+            spec = self.cfg.get_surface_spec(skey)
+            if spec and spec.surface_builder == "ramp" and skey not in self.surfaces:
                 raise ValueError(
-                    f"Missing SurfaceSpec for required input '{skey}'. Available: {available}"
+                    f"Configuration Error: Surface '{skey}' is a ramp, but no file path "
+                    f"could be resolved. Add '{skey}: path/to/file.txt' to the 'files:' "
+                    f"section or define a primary pivot."
                 )
 
-            # Only 'ramp' providers need a scipy interpolator
-            if spec.surface_builder != "ramp":
-                continue
+    @staticmethod
+    def get_ramp_hash(cfg: RenderConfig, resources: RequiredResources) -> str:
+        """
+        HASH: Generates a fingerprint of the  assets used by the ramps.
+        Used by JobResolver to detect if a color palette file was edited.
+        """
+        import hashlib
 
-            # Check if an explicit file exists in the resolved config paths
-            # If not, it will be derived from the primary_path
-            is_explicit = self.cfg.path(skey) is not None
-            base_path = primary_path if not is_explicit else None
+        # Call discovery module
+        ramp_map = SurfaceEngine.get_ramp_paths(cfg, resources)
 
-            self._load_and_interpolate(skey, base_path, ramps_yml_path, out_dir)
+        # Collect paths and mtimes
+        # We sort by key to ensure the hash is deterministic
+        hash_parts = []
+        for skey in sorted(ramp_map.keys()):
+            path = ramp_map[skey].resolve()
+            mtime = path.stat().st_mtime_ns
+            hash_parts.append(f"{skey}:{path}:{mtime}")
 
-        return dict(self.ramp_files)
+        return hashlib.md5("|".join(hash_parts).encode("utf-8")).hexdigest()
 
     def _load_and_interpolate(self, skey, base_path, ramps_yml_path, out_dir):
-        """Helper to resolve a ramp file and build the scipy interpolator."""
+        """Helper to resolve a ramp file and build the optimized FastRamp."""
         yaml_name = f"{skey}_color_ramp"
-
         mode, ramp_path = self._resolve_ramp_file(
             skey=skey, yaml_name=yaml_name, base_ramp_path=base_path, ramp_yml_path=ramps_yml_path,
             output_dir=out_dir
         )
 
         if ramp_path is None or not ramp_path.exists():
-            raise FileNotFoundError(
-                f"Ramp file for {skey} could not be resolved at {ramp_path}"
-            )
+            raise FileNotFoundError(f"Ramp file {skey} not found at {ramp_path}")
 
-        # print(f"   🔹 {skey.ljust(15)} <- {ramp_path.name}")
-
-        # 1. Parse and build the scipy function
+        # 1. Parse the ramp file (raw elevation points and RGB colors)
+        print(f"Load color ramp: key:'{skey}' {ramp_path}")
         z, c = ColorConfig.parse_ramp(str(ramp_path))
         c_rgb = strip_alpha_or_fail(c, context=f"surface ramp {skey}")
 
-        self.surfaces[skey] = interp1d(z, c_rgb, axis=0, fill_value="extrapolate", kind="linear")
-        self.ramp_files[skey] = ramp_path
+        # 2. Initialize FastRamp (it will bake its own LUT internally)
+        self.surfaces[skey] = FastRamp(z, c_rgb)
+        self.ramp_paths[skey] = ramp_path
+
+    def configure_surface(self, resources: RequiredResources, output_dir: Optional[str] = None):
+        self.load_surface_ramps(resources)
+        self._modifier_cache.clear()
+
+        # 1. Bake vectors for active profiles
+        for p_id, profile in self.cfg.modifiers.items():
+            if profile.intensity > 0:
+                self._modifier_cache[p_id] = np.array(
+                    profile.shift_vector, dtype="float32"
+                ) * profile.intensity
+
+        # 2. Build the Execution Plan for every surface
+        self._modifier_plans = {}
+        for s_key, spec in self.spec_registry.items():
+            plan = []
+            for mod_cfg in spec.modifiers:
+                p_id = mod_cfg.get("mod_profile")
+                baked_vec = self._modifier_cache.get(p_id)
+
+                if baked_vec is not None:
+                    # Pre-resolve everything into a simple tuple
+                    plan.append(
+                        (MODIFIER_REGISTRY[mod_cfg["effect"]],  # mod_fn
+                         self.cfg.modifiers[p_id],  # profile
+                         baked_vec,  # baked_vector
+                         mod_cfg.get("noise_id")  # noise_id (optional override)
+                         )
+                    )
+            if plan:
+                self._modifier_plans[s_key] = plan
+
+    def _apply_modifiers(
+            self, srf_key: SurfaceKey, spec: Any, img_block: np.ndarray, noises: NoiseEngine,
+            window: Window
+    ) -> np.ndarray:
+        # 1. Zero-overhead lookup
+        plan = self._modifier_plans.get(srf_key)
+        if not plan:
+            return img_block
+
+        offset = self._offset_cache.get(srf_key, 0)
+
+        # 2. Iterate the pre-resolved plan
+        for mod_fn, profile, baked_vector, noise_id_override in plan:
+            # Noise provider lookup is still here, but could be pre-cached too
+            nid = noise_id_override or profile.noise_id
+
+            noise_2d = noises.get(nid).window_noise(
+                window, row_off=offset, col_off=offset
+            )
+
+            # Library execution
+            img_block = mod_fn(img_block, noise_2d[..., np.newaxis], profile, baked_vector)
+
+        return img_block
 
     def _resolve_ramp_file(
             self, *, skey, yaml_name, base_ramp_path, ramp_yml_path, output_dir

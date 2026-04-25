@@ -153,7 +153,7 @@ Renderers are responsible for stopping heavy CPU tasks for invalid jobs.
 
 ## 5. Writer Process (Active Cleanup)
 
-The Writer is the sole process responsible for managing the physical integrity of the output file.
+The Writer is the sole process responsible for managing the  integrity of the output file.
 
 ### 5.1 Shutdown
 

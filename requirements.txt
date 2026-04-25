@@ -4,4 +4,5 @@ rasterio~=1.4.3
 scipy~=1.16.2
 PyYAML~=6.0.2
 tqdm~=4.67.1
+opencv-python-headless
 setproctitle
