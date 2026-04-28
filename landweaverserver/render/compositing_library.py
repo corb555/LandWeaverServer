@@ -187,7 +187,7 @@ def _validate_spatial(arr: np.ndarray, label: str, target_hw: tuple):
 
 # ---  Utilities ---
 
-def alpha_over(under_rgb: np.ndarray, over_rgb: np.ndarray, over_a: np.ndarray) -> np.ndarray:
+def ZZalpha_over(under_rgb: np.ndarray, over_rgb: np.ndarray, over_a: np.ndarray) -> np.ndarray:
     u = under_rgb.astype(np.float32, copy=False)
     o = over_rgb.astype(np.float32, copy=False)
     a = over_a[..., None]  # HxWx1
@@ -200,7 +200,7 @@ def _require_buffer(buffers, key, context, spec):
     return buffers[key]
 
 
-def _validate_surface(surface, key, context, spec, allow_black=False):
+def ZZ_validate_surface(surface, key, context, spec, allow_black=False):
     if surface is None:
         raise ValueError(f"❌ {context}: Surface '{key}' is None.")
     if not allow_black and float(np.max(surface)) <= 1e-6:

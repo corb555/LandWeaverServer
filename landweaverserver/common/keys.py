@@ -31,8 +31,6 @@ class FileKey(StrEnum):
 @dataclass(frozen=True, slots=True)
 class SourceRndrSpec:
     halo_px: int
-    # cleanup_type: Optional[str] = None
-    # smoothing_radius: Optional[float] = None
     dtype: Any = "float32"
 
 
@@ -50,11 +48,11 @@ class PipelineRequirements:
 
 @dataclass(frozen=True, slots=True)
 class SurfaceSpec:
-    key: Any  # SurfaceKey
+    key: Any
     surface_builder: str
     desc: str
-    files: FrozenSet[Any] = None  # FileKey
-    source: Optional[Any] = None  # SourceKey
+    files: FrozenSet[Any] = None
+    source: Optional[Any] = None
     required_factors: Tuple[str, ...] = field(default_factory=tuple)
     input_factor: Optional[str] = None
     modifiers: Optional[List] = None
@@ -68,40 +66,30 @@ class ConfigView(Protocol):
 class FactorSpec:
     name: str
     factor_builder: str
-
-    # Use Tuple allow indexing [0]
     sources: Tuple[str, ...] = field(default_factory=tuple)
     files: Tuple[str, ...] = field(default_factory=tuple)
     required_factors: Tuple[str, ...] = field(default_factory=tuple)
     noise_id: Optional[str] = None
     desc: str = ""
+    # some other parameters
     params: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class _BlendSpec:
-    blend_op: str  # Entry in CompositingOps registry
-    desc: str = ""  # Human-readable for the GUI/Report
+    blend_op: str
+    desc: str = ""
     enabled: bool = True
-
-    # Spatial Inputs (The 'Wires' in a node graph)
-    factor: Optional[str] = None  # The logic field (e.g. water_depth_f)
-    mask_nm: Optional[str] = None  # The boundary field (e.g. water_f)
-
-    # Palette/Surface Inputs
+    factor: Optional[str] = None
+    mask_nm: Optional[str] = None
     input_surfaces: List[SurfaceKey] = field(default_factory=list)
     output_surface: Optional[SurfaceKey] = None
-
-    # Routing
     buffer: str = DEFAULT_BUFFER  # default buffer
     merge_buffer: Optional[str] = None
-
-    # Global Signal Processing
     scale: float = 1.0
     contrast: float = 0.0
     bias: float = 0.0
-
-    # Operation-Specific Parameters
+    # some other Parameters
     params: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -182,7 +170,7 @@ class ResolvedManifest:
 
 
 @dataclass(frozen=True, slots=True)
-class ThemeSmoothingSpec:
+class ZZThemeSmoothingSpec:
     """
     Parameters for Raster Boundary Refinement and Generalization.
 
@@ -219,7 +207,7 @@ class ThemeSmoothingSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class EdgeProfile:
+class ZZEdgeProfile:
     """
     Parameters for the spatial blending of feature margins.
 
@@ -262,7 +250,7 @@ class EdgeProfile:
 
 
 @dataclass(frozen=True, slots=True)
-class _GatedStepSpec:
+class ZZ_GatedStepSpec:
     source_key: Any
     factor_key: Any
     default_fill: float

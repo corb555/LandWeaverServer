@@ -262,7 +262,7 @@ An error response is sent only when the message is structurally valid but one or
     "percent": 0.2,
     "row": 0.1,
     "col": 0.9,
-    "region": "Sedona"
+    "prefix": "Sedona"
   }
 }
 ```
