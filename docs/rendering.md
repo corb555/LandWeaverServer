@@ -253,7 +253,7 @@ the rendering pipeline **where** and **how strongly** to apply an effect.
 Some factors preserve raw values exactly, while others convert a raster into a normalized 0–1 mask, a distance-based gradient, 
 a thematic class mask, or a more natural-looking terrain boundary.
 
-## Factor Builders 
+## Factor Ops 
 
 ## raw_source
 Prepares a source raster without change for pipeline use.  Note, you cannot directly use a source raster without going through at
@@ -283,7 +283,7 @@ In most cases, this is the factor to use when you want a raster to act like a sm
 ```yaml
 factors:
   precip:
-    factor_builder: mapped_signal
+    op: mapped_signal
     sources: [precip]
     noise_id: biome
     params:
@@ -328,7 +328,7 @@ Typical uses include:
 ```yaml
 factors:
   theme_overlay_alpha:
-    factor_builder: theme_composite
+    op: theme_composite
     sources: [theme]
     params:
       water:
@@ -379,7 +379,7 @@ Typical uses include:
 ```yaml
 factors:
   hillshade_safe:
-    factor_builder: protected_shaping
+    op: protected_shaping
     sources: [hillshade]
     params:
       input_scale: 255.0
@@ -425,7 +425,7 @@ Typical uses include:
 ```yaml
 factors:
   water_glints:
-    factor_builder: specular_highlights
+    op: specular_highlights
     noise_id: water
     required_factors: [water_mask]
     params:
@@ -469,7 +469,7 @@ Typical uses include:
 ```yaml
 factors:
   rock_texture:
-    factor_builder: noise_overlay
+    op: noise_overlay
     noise_id: fine_mottle
     required_factors: [rock_mask]
     params:
@@ -511,7 +511,7 @@ Typical uses include:
 ```yaml
 factors:
   water_depth:
-    factor_builder: proximity_power
+    op: proximity_power
     sources: [water_proximity]
     required_factors: [water_mask]
     params:
@@ -553,7 +553,7 @@ Typical uses include:
 ```yaml
 factors:
   water_mask:
-    factor_builder: categorical_mask
+    op: categorical_mask
     sources: [theme]
     params:
       label: water
@@ -594,7 +594,7 @@ Typical uses include:
 ```yaml
 factors:
   shoreline_fade:
-    factor_builder: edge_fade
+    op: edge_fade
     sources: [water_proximity]
     params:
       label: water
@@ -656,7 +656,7 @@ Typical uses include:
 ```yaml
 factors:
   snow_mask:
-    factor_builder: constrained_signal
+    op: constrained_signal
     sources: [dem, slope]
     params:
       threshold: 3200
@@ -688,12 +688,12 @@ Use `raster_calculator` when you want to combine existing sources and factors wi
 
 ### Basic syntax
 
-Set `factor_builder` to `raster_calculator` and provide an expression string in `params.expr`.
+Set `op` to `raster_calculator` and provide an expression string in `params.expr`.
 
 ```yaml
 factors:
   alpine_mask:
-    factor_builder: raster_calculator
+    op: raster_calculator
     sources: [dem]
     params:
       expr: "clamp((dem - 2500) / 500, 0, 1)"
@@ -711,11 +711,11 @@ Any factor referenced here must be defined earlier in the configuration so it is
 ```yaml
 factors:
   moisture:
-    factor_builder: mapped_signal
+    op: mapped_signal
     sources: [precip]
 
   lush_valley:
-    factor_builder: raster_calculator
+    op: raster_calculator
     sources: [dem]
     required_factors: [moisture]
     params:
@@ -749,7 +749,7 @@ factors:
 ```yaml
 factors:
   complex_snow:
-    factor_builder: raster_calculator
+    op: raster_calculator
     sources: [dem, slope]
     required_factors: [jitter]
     params:
@@ -875,9 +875,9 @@ Typical uses include:
 
 ## Surfaces
 
-Surfaces are created using `surface_builders` as follows.
+Surfaces are created using `ops` as follows.
 
-### Ramp Surface Builder
+### Ramp Surface Op
 
 A **ramp surface** uses a continuous raster value—most often elevation—to sample a color ramp and create a render-ready visual layer.
 
@@ -890,7 +890,7 @@ Typical uses include:
 - dry-to-moist land color variation
 - broad terrain base layers
 
-### Theme Surface Builder
+### Theme Surface Op
 
 A **theme surface** uses a categorical theme raster and its class styling to create a visual overlay.
 
@@ -902,16 +902,16 @@ Typical uses include:
 
 # Reference Guide
 
-## Surface Builders 
+## Surface Ops 
 
-| Surface Builder   | Purpose                                                                                                              | Typical use |
+| Surface Op   | Purpose                                                                                                              | Typical use |
 |-------------------|----------------------------------------------------------------------------------------------------------------------|---|
 | `ramp`            | Uses a continuous raster value, most often elevation, to sample a color ramp and create a render-ready visual layer. | Elevation-based terrain coloring, snow coloring by elevation, broad terrain base layers |
 | `theme`           | Uses a categorical theme raster and its class styling to create a visual overlay.                                    | Water, glacier, rock, volcanic, or playa overlays from a theme raster |
 
-## Factor Builders
+## Factor Ops
 
-| Factor Builder        | Purpose                                                                          | Typical  use                                                                    |
+| Factor Op        | Purpose                                                                          | Typical  use                                                                    |
 |-----------------------|----------------------------------------------------------------------------------|------------------------------------------------------------------------------------|
 | `raw_source`          | Passes a source raster through unchanged                                         | Raw elevation in meters, raw slope, raw theme IDs.                                 |
 | `mapped_signal`       | Translates a specific range of raw input values into the 0.0–1.0  range          | Moisture gradients, vegetation density, lithology influence, normalized elevation. |
@@ -927,7 +927,7 @@ Typical uses include:
 |                       | optional noise jitter, and a physical constraint.                                |                                                                                    |
 | `raster_calculator`   | Evaluates a validated custom math expression using declared sources and factors. | Custom raster logic, one-off masks, terrain rules, prototype factors.              |
 
-## Blend Operations 
+## Blend Ops 
 
 | Operation                 | Purpose                                                              | Typical use                                        |
 |---------------------------|----------------------------------------------------------------------|----------------------------------------------------|

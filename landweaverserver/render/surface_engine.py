@@ -97,7 +97,7 @@ class SurfaceEngine:
     ) -> Dict[SurfaceKey, np.ndarray]:
         """
         Synthesizes the required RGB surfaces for the current tile.
-        The comp engine will use blend_ops and factors to combine these into the final result
+        The comp engine will use blend ops and factors to combine these into the final result
         """
         # Establish master geometry from the anchor
         anchor_data = data_2d.get(anchor_key)
@@ -122,11 +122,11 @@ class SurfaceEngine:
                     f"Check your SURFACE_SPECS definition. Available: {available}"
                 )
 
-            provider_fn = SURFACE_PROVIDER_REGISTRY.get(spec.surface_builder)
+            provider_fn = SURFACE_PROVIDER_REGISTRY.get(spec.op)
             if not provider_fn:
                 available = list(SURFACE_PROVIDER_REGISTRY.keys())
                 raise ValueError(
-                    f"Unknown provider '{spec.surface_builder}' for surface {srf_key}. Available: "
+                    f"Unknown provider '{spec.op}' for surface {srf_key}. Available: "
                     f"{available}"
                 )
 
@@ -193,7 +193,7 @@ class SurfaceEngine:
         # 3. Resolve every required input
         for skey in resources.surface_inputs:
             spec = cfg.get_surface_spec(skey)
-            if spec is None or spec.surface_builder != "ramp":
+            if spec is None or spec.op != "ramp":
                 continue
 
             # Check for explicit entry in the ramps YAML
@@ -233,7 +233,7 @@ class SurfaceEngine:
         # If a surface is a 'ramp' but didn't get a path, we MUST fail here.
         for skey in resources.surface_inputs:
             spec = self.cfg.get_surface_spec(skey)
-            if spec and spec.surface_builder == "ramp" and skey not in self.surfaces:
+            if spec and spec.op == "ramp" and skey not in self.surfaces:
                 raise ValueError(
                     f"Configuration Error: Surface '{skey}' is a ramp, but no file path "
                     f"could be resolved. Add '{skey}: path/to/file.txt' to the 'files:' "
@@ -282,35 +282,58 @@ class SurfaceEngine:
         self.ramp_paths[skey] = ramp_path
 
     def configure_surface(self, resources: RequiredResources, output_dir: Optional[str] = None):
-        self.load_surface_ramps(resources)
-        self._modifier_cache.clear()
+            """
+            Pre-calculates the execution plan for all surfaces and modifiers.
+            """
+            self.load_surface_ramps(resources)
+            self._modifier_cache.clear()
 
-        # 1. Bake vectors for active profiles
-        for p_id, profile in self.cfg.modifiers.items():
-            if profile.intensity > 0:
-                self._modifier_cache[p_id] = np.array(
-                    profile.shift_vector, dtype="float32"
-                ) * profile.intensity
+            # 1. Bake vectors for active profiles
+            # We assume self.cfg.modifiers now maps to profiles that include 'effect'
+            for p_id, profile in self.cfg.modifiers.items():
+                if profile.intensity > 0:
+                    self._modifier_cache[p_id] = np.array(
+                        profile.shift_vector, dtype="float32"
+                    ) * profile.intensity
 
-        # 2. Build the Execution Plan for every surface
-        self._modifier_plans = {}
-        for s_key, spec in self.spec_registry.items():
-            plan = []
-            for mod_cfg in spec.modifiers:
-                p_id = mod_cfg.get("mod_profile")
-                baked_vec = self._modifier_cache.get(p_id)
+            # 2. Build the Execution Plan for every surface
+            self._modifier_plans = {}
+            for s_key, spec in self.spec_registry.items():
+                plan = []
 
-                if baked_vec is not None:
-                    # Pre-resolve everything into a simple tuple
-                    plan.append(
-                        (MODIFIER_REGISTRY[mod_cfg["effect"]],  # mod_fn
-                         self.cfg.modifiers[p_id],  # profile
-                         baked_vec,  # baked_vector
-                         mod_cfg.get("noise_id")  # noise_id (optional override)
-                         )
-                    )
-            if plan:
-                self._modifier_plans[s_key] = plan
+                # SCHEMA V2: spec.modifiers is now a list of profile IDs (strings)
+                # Example: modifiers: ["forest_mod", "arid_mod"]
+                for p_id in spec.modifiers:
+                    # Handle both string references and potential dict overrides
+                    if isinstance(p_id, dict):
+                        profile_name = p_id.get("profile")
+                        noise_override = p_id.get("noise_id")
+                    else:
+                        profile_name = p_id
+                        noise_override = None
+
+                    profile = self.cfg.modifiers.get(profile_name)
+                    baked_vec = self._modifier_cache.get(profile_name)
+
+                    if profile and baked_vec is not None:
+                        modifier_op = profile.op
+                        mod_fn = MODIFIER_REGISTRY.get(modifier_op)
+
+                        if not mod_fn:
+                            print(f"⚠️ Warning: Unknown modifier op '{modifier_op}' in profile '{profile_name}'")
+                            continue
+
+                        # Pre-resolve everything into the execution plan
+                        plan.append(
+                            (mod_fn,             # The algorithm (color_mottle, etc)
+                             profile,            # The profile data
+                             baked_vec,          # Pre-multiplied intensity/vector
+                             noise_override      # Optional noise override
+                             )
+                        )
+
+                if plan:
+                    self._modifier_plans[s_key] = plan
 
     def _apply_modifiers(
             self, srf_key: SurfaceKey, spec: Any, img_block: np.ndarray, noises: NoiseEngine,
@@ -325,7 +348,6 @@ class SurfaceEngine:
 
         # 2. Iterate the pre-resolved plan
         for mod_fn, profile, baked_vector, noise_id_override in plan:
-            # Noise provider lookup is still here, but could be pre-cached too
             nid = noise_id_override or profile.noise_id
 
             noise_2d = noises.get(nid).window_noise(

@@ -45,7 +45,6 @@ class CompositingEngine:
         #    else:
         #        print(f"DEBUG [Compositor] Surface {key} is EMPTY (All Zeros)")
 
-        # 1. ESTABLISH SPATIAL GEOMETRY
         # All surfaces in this tile must share the same resolution.
         first_surf = next(iter(surfaces.values()))
         self.target_shape = first_surf.shape[:2]
@@ -53,15 +52,15 @@ class CompositingEngine:
         active_surfaces = dict(surfaces)
         buffers: Dict[str, np.ndarray] = {}
 
-        # 2. EXECUTE PIPELINE STEPS
+        #  EXECUTE PIPELINE STEPS
         for i, step in enumerate(pipeline):
             if not step.enabled:
                 continue
 
             # Resolve the operator logic from the library registry
-            operator = COMPOSITING_REGISTRY.get(step.blend_op)
+            operator = COMPOSITING_REGISTRY.get(step.op)
             if not operator:
-                raise ValueError(f"Step {i}: Unknown blend_op '{step.blend_op}'")
+                raise ValueError(f"Step {i}: Unknown blend_op '{step.op}'")
 
             # Instrumentation: Track timing per operation
             # self.tmr.start(f"    {step.factor or 'none'}:{step.blend_op}")
@@ -81,7 +80,7 @@ class CompositingEngine:
                 raise e
 
             # Once we have output the buffer, go to next step!
-            if step.blend_op == "output_buffer":
+            if step.op == "output_buffer":
                 continue
 
         # 5. FINALIZE FOR STORAGE
@@ -140,7 +139,7 @@ class CompositingEngine:
 
         print(f"Error:        {e}")
         print(f"Step Index:   {index}")
-        print(f"Operation:    {spec.blend_op}")
+        print(f"Operation:    {spec.op}")
         print(f"Description:  {spec.desc}")
         print(f"-" * 40)
 

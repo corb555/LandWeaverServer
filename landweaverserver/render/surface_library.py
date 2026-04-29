@@ -21,9 +21,8 @@ class SurfaceContext:
     target_shape: Tuple[int, int]  # (H, W) for the current tile
 
 
-def surface_builder(surface_builder_nm: str):
+def surface_op(surface_op_name: str):
     """
-    Updated Decorator Contract:
     Receives 6 arguments (ctx, spec, data_2d, masks_2d, factors_2d, style_engine)
     Enforces (H, W, 3) float32 output.
     """
@@ -43,13 +42,13 @@ def surface_builder(surface_builder_nm: str):
 
             return res.astype("float32", copy=False)
 
-        SURFACE_PROVIDER_REGISTRY[surface_builder_nm] = wrapper
+        SURFACE_PROVIDER_REGISTRY[surface_op_name] = wrapper
         return wrapper
 
     return decorator
 
 
-@surface_builder("theme")
+@surface_op("theme")
 def _theme_provider(ctx: SurfaceContext, spec, data_2d, masks_2d, factors_2d, style_engine):
     """Generate the theme surface for the current tile."""
     theme_ids = data_2d.get(spec.source)
@@ -68,7 +67,7 @@ def _theme_provider(ctx: SurfaceContext, spec, data_2d, masks_2d, factors_2d, st
         theme_ids, ctx, tile_ctx=tile_ctx, )
 
 
-@surface_builder("ramp")
+@surface_op("ramp")
 def _ramp_provider(ctx: SurfaceContext, spec, data_2d, masks_2d, factors_2d, style_engine):
     f_id = spec.input_factor
     factor_val = factors_2d.get(f_id)

@@ -14,9 +14,9 @@ from landweaverserver.render.utils import SAFE_FUNCTIONS
 FACTOR_REGISTRY: Dict[str, Callable] = {}
 
 
-def factor_builder(factor_builder_nm: str):
+def factor_op(factor_op_name: str):
     """
-    Registers a library function and enforces the (H, W, 1) storage contract.
+    Registers a Factor Op and enforces the (H, W, 1) storage contract.
     """
 
     def decorator(func):
@@ -34,7 +34,7 @@ def factor_builder(factor_builder_nm: str):
             # Promote to 3D for the storage layer firewall
             return res_2d[..., np.newaxis]
 
-        FACTOR_REGISTRY[factor_builder_nm] = wrapper
+        FACTOR_REGISTRY[factor_op_name] = wrapper
         return wrapper
 
     return decorator
@@ -121,7 +121,7 @@ def _mapped_signal(data_2d, masks_2d, name, lib_ctx, source_key):
 
 class FactorLibrary:
     @staticmethod
-    @factor_builder("mapped_signal")
+    @factor_op("mapped_signal")
     def mapped_signal(data_2d, masks_2d, name, lib_ctx):
         """
         """
@@ -129,7 +129,7 @@ class FactorLibrary:
         return _mapped_signal(data_2d, masks_2d, name, lib_ctx, source_key)
 
     @staticmethod
-    @factor_builder("raw_source")
+    @factor_op("raw_source")
     def raw_source(data_2d, masks_2d, name, lib_ctx):
         """
         Identity Operation: Promotes a  source to a logical factor.
@@ -174,31 +174,52 @@ class FactorLibrary:
         return np.squeeze(raw_data)
 
     @staticmethod
-    @factor_builder("theme_composite")
+    @factor_op("theme_composite")
     def theme_composite(data_2d, masks_2d, name, lib_ctx):
-        # Use the first source for this factor
+        """
+        This factor op performs 'Competitive Alpha Resolution':
+        Each category is refined (blurred/noised) independently, then they
+        compete for dominance in the final composite based on signal strength.
+        Raw GIS themes have 'hard' binary edges. Real-world transitions
+        (like forest to meadow) are soft.
+        """
+        # 1. Identify the input theme raster (e.g., categorical landcover)
         drv_key = list(lib_ctx.spec.sources)[0]
-
-        """Aggregate configured thematic categories into a composite alpha."""
         theme_ids = data_2d[drv_key]
 
+        # 2. Extract only the IDs present in this tile to avoid processing empty categories
         tile_ctx = lib_ctx.themes.build_tile_context(theme_ids)
+
+        # 3. Initialize an alpha 'Canvas' for competitive strength
         composite_alpha = np.zeros(lib_ctx.target_shape, dtype=np.float32)
 
         for spec in tile_ctx.active_specs:
+            # 4. Extract a raw binary mask (0 or 1) for this specific theme ID
             binary_mask = tile_ctx.masks_by_id[spec.theme_id]
             if not np.any(binary_mask):
                 continue
 
+            # 5. INDEPENDENT REFINEMENT:
+            # refine_signal() applies the category-specific 'blur_px' and 'noise_amp'
             cat_alpha = refine_signal(
                 mask=binary_mask, params=spec, ctx=lib_ctx
             )
+
+            # 6. COMPETITIVE COMBINATION (Max-Alpha):
+            # When we blur independent masks, they will inevitably overlap.
+            # Using np.maximum ensures that at any given pixel, the category
+            # with the strongest signal 'wins'.
+            #
+            # This  ensures a clean, non-additive transition between
+            # smoothed categories.
             composite_alpha = np.maximum(composite_alpha, cat_alpha)
 
+        # 7. Apply the master validity mask (NoData gating) and return
+        # np.squeeze ensures the mask matches the 2D shape of the composite.
         return composite_alpha * np.squeeze(masks_2d[drv_key])
 
     @staticmethod
-    @factor_builder("protected_shaping")
+    @factor_op("protected_shaping")
     def protected_shaping(data_2d, masks_2d, name, lib_ctx):
         """
         Shapes a grayscale signal into a multiplicative factor while
@@ -256,7 +277,7 @@ class FactorLibrary:
         return 1.0 + valid_mask * (m_final - 1.0)
 
     @staticmethod
-    @factor_builder("specular_highlights")
+    @factor_op("specular_highlights")
     def specular_highlights(data_2d, masks_2d, name, lib_ctx):
         params = lib_ctx.spec.params
         noise_id = lib_ctx.spec.noise_id
@@ -278,7 +299,7 @@ class FactorLibrary:
         return glints * mask
 
     @staticmethod
-    @factor_builder("noise_overlay")
+    @factor_op("noise_overlay")
     def noise_overlay(data_2d, masks_2d, name, lib_ctx):
         params = lib_ctx.spec.params
 
@@ -300,7 +321,7 @@ class FactorLibrary:
         return 1.0 + mask * (shading - 1.0)
 
     @staticmethod
-    @factor_builder("proximity_power")
+    @factor_op("proximity_power")
     def proximity_power(data_2d, masks_2d, name, lib_ctx):
         params = lib_ctx.spec.params
         source_key = next(iter(lib_ctx.spec.sources))
@@ -337,7 +358,7 @@ class FactorLibrary:
         return np.squeeze(res * mask)
 
     @staticmethod
-    @factor_builder("categorical_mask")
+    @factor_op("categorical_mask")
     def categorical_mask(data_2d, masks_2d, name, lib_ctx):
         # Pull the label from the config for THIS factor (e.g., params['label'] = "water")
         params = lib_ctx.spec.params
@@ -357,7 +378,7 @@ class FactorLibrary:
         return (theme_ids == target_val).astype("float32")
 
     @staticmethod
-    @factor_builder("edge_fade")
+    @factor_op("edge_fade")
     def edge_fade(data_2d, masks_2d, name, lib_ctx):
         """
         Creates an organic alpha transition based on proximity within a specific category.
@@ -440,7 +461,7 @@ class FactorLibrary:
     """
 
     @staticmethod
-    @factor_builder("constrained_signal")
+    @factor_op("constrained_signal")
     def constrained_signal(data_2d, masks_2d, name, lib_ctx):
         """
         Calculates a naturalized boundary mask with zero-safe logic.
@@ -504,7 +525,7 @@ class FactorLibrary:
         return np.squeeze(mask * penalty)
 
     @staticmethod
-    @factor_builder("raster_calculator")
+    @factor_op("raster_calculator")
     def expression(data_2d, masks_2d, name, lib_ctx):
         """Evaluate a precompiled safe math expression for the current tile."""
         code = lib_ctx.expression_cache.get(name)
@@ -559,25 +580,3 @@ class FactorLibrary:
             )
 
         return result * valid_mask
-
-
-def ZZ_get_required_factor(ctx, name):
-    """
-    Safely retrieves a previously computed factor.
-    Provides high-fidelity error messages for dependency/sequence issues.
-    """
-    f = ctx.factors.get(name)  # Check the SimpleNamespace factors dict
-    if f is not None:
-        return np.squeeze(f)
-
-    # If missing, investigate why to help the designer fix the pipeline
-    # from LandWeaverServer.settings import FACTOR_SPECS
-    all_defined = [s.name for s in FACTOR_SPECS]
-
-    if name not in all_defined:
-        raise KeyError(f"Factor Logic Error: '{name}' is used but not defined in settings.py.")
-    else:
-        raise KeyError(
-            f"Factor Sequence Error: A factor tried to access '{name}', "
-            f"but '{name}' hasn't been generated yet. Move '{name}' higher in FACTOR_SPECS."
-        )

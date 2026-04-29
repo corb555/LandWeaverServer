@@ -76,7 +76,7 @@ flowchart LR
 LandWeaver is driven by a user-configured compositing sequence. 
 
 * **Flexible raster inputs** — ingest geospatial rasters such as DEM, precipitation, canopy, or lithology
-* **Logical blending** — combine layers using operations such as `lerp_surfaces`, `alpha_over`, and `lerp_buffers`
+* **Logical blending** — combine layers using operations such as `blend_surfaces`, `alpha_over`, and `blend_buffers`
 * **Controlled shading** — apply hillshade with highlight and shadow protection to preserve vibrancy 
 and clean midtones
 

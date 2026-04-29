@@ -41,7 +41,7 @@ def main():
     # 4. Execute renders
     try:
         pipeline.start()
-        print("🛑 Engine Closed. Shutdown completed.")
+        print("🛑 Shutdown complete.")
     except Exception as e:
         print(f"\n❌ pipeline error: {e}")
         import traceback

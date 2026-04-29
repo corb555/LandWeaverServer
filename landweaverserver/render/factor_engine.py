@@ -26,15 +26,15 @@ class FactorRegistry:
     """Maps factor  ids to implementations."""
     fns: Mapping[str, FactorFn]
 
-    def get(self, factor_builder: str) -> FactorFn:
-        key = (factor_builder or "").strip()
+    def get(self, factor_op: str) -> FactorFn:
+        key = (factor_op or "").strip()
         if not key:
-            raise ValueError(" factor_builder is empty.")
+            raise ValueError(" Factor Op is empty.")
         fn = self.fns.get(key)
         if fn is None:
             available = ", ".join(sorted(self.fns.keys()))
             raise KeyError(
-                f"Unknown factor_builder '{factor_builder}' in Factor Specs. Available: "
+                f"Unknown Factor Op '{factor_op}' in Factor Specs. Available: "
                 f"{available}"
             )
         return fn
@@ -55,16 +55,16 @@ class FactorEngine:
         # Resolve compute callables
         self._compiled = []
         for spec in self.specs:
-            fn = FACTOR_REGISTRY.get(spec.factor_builder)
+            fn = FACTOR_REGISTRY.get(spec.op)
             if fn is None:
                 available = sorted(FACTOR_REGISTRY.keys())
 
                 raise KeyError(
                     f"\n❌ Factor Engine Initialization Error:\n"
-                    f"   Factor '{spec.name}' requested an unknown factor_builder: '"
-                    f"{spec.factor_builder}'.\n"
+                    f"   Factor '{spec.name}' requested an unknown Factor Op: '"
+                    f"{spec.op}'.\n"
                     f"   Check your FACTOR_SPECS in settings.py or land weaver yml for typos.\n"
-                    f"   Available Function IDs: {available}"
+                    f"   Available Factor Ops: {available}"
                 )
 
             self._compiled.append((spec, fn))

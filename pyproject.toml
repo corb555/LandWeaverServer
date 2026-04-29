@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "land-weaver-server"
-version = "2.2.0"
+version = "2.2.1"
 description = "A programmable spatial compositing engine for transforming GIS rasters and categorical layers into refined, georeferenced cartographic surfaces."
 authors = [{ name = "corb" }]
 readme = { file = "docs/README.md", content-type = "text/markdown" }

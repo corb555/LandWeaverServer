@@ -88,10 +88,10 @@ class ThemeRegistry:
         return self._runtime_specs_by_id
 
     def load_metadata(self, render_cfg: Any) -> None:
-        """Methodical Ingestion: Extracts theme logic from the factor params."""
+        """Extract theme logic from the factor categories."""
         self.cfg = render_cfg
 
-        # 1. QML colors
+        # 1. Get colors from QML file
         qml_path = render_cfg.path("theme_qml")
         if not qml_path or not qml_path.exists():
             raise FileNotFoundError(f"Theme QML not found: {qml_path}")
@@ -110,22 +110,26 @@ class ThemeRegistry:
             if rgb:
                 self._id_to_color[int(value_str)] = rgb
 
-        # We search the factors list for the one that drives theme composition
+        # 4. Find the factor that drives theme composition
+        # (schema Stage 2 uses factor_builder; Stage 3 will change this to .op == "theme_composite")
         theme_factor = next(
-            (f for f in render_cfg.factors if f.factor_builder == "theme_composite"), None
+            (f for f in render_cfg.factors if f.op == "theme_composite"), None
         )
 
         # 5. BUILD SPECS
-        # If no factor found, we pass an empty dict to use defaults
-        categories_cfg = theme_factor.params if theme_factor else {}
+        # SCHEMA V2: Use the dedicated categories attribute
+        # Fallback to params to maintain compatibility during the transition
+        categories_cfg = {}
+        if theme_factor:
+            categories_cfg = theme_factor.categories
+
         self._build_runtime_specs(render_cfg, categories_cfg)
 
     def _build_runtime_specs(self, render_cfg: Any, categories_cfg: Dict[str, Any]) -> None:
         """Constructs ThemeRuntimeSpecs from the consolidated categories dictionary."""
 
-        # We iterate over labels found in the QML palette to ensure 100% coverage
         for label, theme_id in self._name_to_id.items():
-            # Get settings from factor params, fallback to _default_
+            # SCHEMA V2: Looking directly into the categories dictionary
             cat_cfg = categories_cfg.get(label)
             if cat_cfg is None:
                 continue
@@ -135,12 +139,15 @@ class ThemeRegistry:
                 continue
 
             rgb = self._id_to_color.get(theme_id, (0, 0, 0))
+
+            # Use .get() with defaults for all tuning parameters
             surface_shift_vector = cat_cfg.get("surface_shift_vector", (0.0, 0.0, 0.0))
 
             try:
-                # Build the unified spec containing  Smoothing and Rendering data
                 spec = ThemeRuntimeSpec(
-                    label=label, theme_id=theme_id, rgb=rgb,  # Rendering Params
+                    label=label,
+                    theme_id=theme_id,
+                    rgb=rgb,
                     max_opacity=float(cat_cfg.get("max_opacity", 1.0)),
                     blur_px=float(cat_cfg.get("blur_px", 0.0)),
                     noise_amp=float(cat_cfg.get("noise_amp", 0.0)),
@@ -149,7 +156,8 @@ class ThemeRegistry:
                     smoothing_radius=float(cat_cfg.get("smoothing_radius", 0.0)),
                     surface_noise_id=cat_cfg.get("surface_noise_id"),
                     surface_intensity=float(cat_cfg.get("surface_intensity", 0.0)),
-                    surface_shift_vector=tuple(float(v) for v in surface_shift_vector), enabled=True
+                    surface_shift_vector=tuple(float(v) for v in surface_shift_vector),
+                    enabled=True
                 )
 
                 self._runtime_specs_by_label[label] = spec
@@ -160,7 +168,7 @@ class ThemeRegistry:
 
     def _extract_theme_category_config(self, render_cfg: Any) -> Dict[str, Any]:
         """
-        Extracts theme settings directly from the theme_render block.
+        Extracts theme settings  from the theme_render block.
         Filters out metadata keys by checking against known QML labels.
         """
         # 1. Get the structured attribute
@@ -221,7 +229,6 @@ class ThemeRegistry:
             active_specs.append(spec)
             masks_by_id[theme_id] = (theme_ids == theme_id).astype(np.float32)
 
-        # xyzzy active_specs.sort(key=lambda item: item.theme_id)
         return ThemeTileContext(
             theme_ids=theme_ids, present_ids=present_ids, active_specs=active_specs,
             masks_by_id=masks_by_id, )

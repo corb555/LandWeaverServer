@@ -62,8 +62,8 @@ class CompositingLibrary:
         buffers[spec.buffer] = src.copy()
 
     @staticmethod
-    @register_op("lerp_surfaces", required_attrs=["output_surface", "input_surfaces", "factor"])
-    def lerp_surfaces(buffers, surfaces, factors, factor, spec, ctx):
+    @register_op("blend_surfaces", required_attrs=["output_surface", "input_surfaces", "factor"])
+    def blend_surfaces(buffers, surfaces, factors, factor, spec, ctx):
         p_a = surfaces.get(spec.input_surfaces[0])
         p_b = surfaces.get(spec.input_surfaces[1])
         _validate_spatial(p_a, spec.input_surfaces[0], ctx.target_shape)
@@ -77,17 +77,6 @@ class CompositingLibrary:
         surfaces[spec.output_surface] = p_a + factor * (p_b - p_a)
 
     @staticmethod
-    @register_op("lerp", required_attrs=["buffer", "input_surfaces", "factor"])
-    def lerp_surface_to_buffer(buffers, surfaces, factors, factor, spec, ctx):
-        target_rgb = surfaces.get(spec.input_surfaces[0])
-        current = buffers.get(spec.buffer)
-
-        _validate_spatial(target_rgb, spec.input_surfaces[0], ctx.target_shape)
-        _validate_spatial(current, spec.buffer, ctx.target_shape)
-
-        buffers[spec.buffer] = current + factor * (target_rgb - current)
-
-    @staticmethod
     @register_op("multiply", required_attrs=["buffer", "factor"])
     def multiply_op(buffers, surfaces, factors, factor, spec, ctx):
         current = buffers.get(spec.buffer)
@@ -97,20 +86,27 @@ class CompositingLibrary:
         buffers[spec.buffer] = np.clip(current * factor, 0, 255)
 
     @staticmethod
-    @register_op("alpha_over", required_attrs=["buffer", "input_surfaces", "factor"])
-    def alpha_over_op(buffers, surfaces, factors, factor, spec, ctx):
-        under = buffers.get(spec.buffer)
-        over = surfaces.get(spec.input_surfaces[0])
-
-        _validate_spatial(under, spec.buffer, ctx.target_shape)
-        _validate_spatial(over, spec.input_surfaces[0], ctx.target_shape)
-
-        a = factor
-        buffers[spec.buffer] = (over * a) + (under * (1.0 - a))
+    @register_op("blend_overlay")
+    def blend_overlay_op(buffers, surfaces, factors, factor, spec, ctx):
+        target = surfaces.get(spec.input_surfaces[0])
+        current = buffers.get(spec.buffer)
+        _validate_spatial(target, spec.input_surfaces[0], ctx.target_shape)
+        _validate_spatial(current, spec.buffer, ctx.target_shape)
+        buffers[spec.buffer] = _lerp_math(current, target, factor)
 
     @staticmethod
-    @register_op("lerp_buffers", required_attrs=["buffer", "merge_buffer", "factor"])
-    def lerp_buffers(buffers, surfaces, factors, factor, spec, ctx):
+    @register_op("alpha_over")
+    def alpha_over_op(buffers, surfaces, factors, factor, spec, ctx):
+        # This is the same math as blend_overlay. It is a synonym
+        target = surfaces.get(spec.input_surfaces[0])
+        current = buffers.get(spec.buffer)
+        _validate_spatial(target, spec.input_surfaces[0], ctx.target_shape)
+        _validate_spatial(current, spec.buffer, ctx.target_shape)
+        buffers[spec.buffer] = _lerp_math(current, target, factor)
+
+    @staticmethod
+    @register_op("blend_buffers", required_attrs=["buffer", "merge_buffer", "factor"])
+    def blend_buffers(buffers, surfaces, factors, factor, spec, ctx):
         under = buffers.get(spec.buffer)
         over = buffers.get(spec.merge_buffer)
 
@@ -118,15 +114,15 @@ class CompositingLibrary:
         _validate_spatial(over, spec.merge_buffer, ctx.target_shape)
 
         if factor is None:
-            raise ValueError(f"lerp_buffers op requires a factor (missing '{spec.factor}')")
+            raise ValueError(f"blend_buffers op requires a missing factor: '{spec.factor}'")
 
         buffers[spec.buffer] = under + factor * (over - under)
 
     @staticmethod
     @register_op(
-        "add_specular_highlights", required_attrs=["buffer", "factor"], required_params=["color"]
+        "specular_highlights", required_attrs=["buffer", "factor"], required_params=["color"]
     )
-    def add_specular(buffers, surfaces, factors, factor, spec, ctx):
+    def specular_highlights(buffers, surfaces, factors, factor, spec, ctx):
         current = buffers.get(spec.buffer)
         _validate_spatial(current, spec.buffer, ctx.target_shape)
 
@@ -145,8 +141,8 @@ class CompositingLibrary:
         buffers["__final_output__"] = buffers[src_name]
 
     @staticmethod
-    @register_op("apply_zonal_gradient", required_params=["color_0", "color_1"])
-    def apply_zonal_gradient(buffers, surfaces, factors, factor, spec, ctx):
+    @register_op("gradient_fill", required_params=["color_0", "color_1"])
+    def gradient_fill(buffers, surfaces, factors, factor, spec, ctx):
         """Fills a masked area with a gradient between color_0 and color_1."""
         current = _require_buffer(buffers, spec.buffer, context="zonal_gradient", spec=spec)
         mask = factors.get(spec.mask_nm)
@@ -184,24 +180,12 @@ def _validate_spatial(arr: np.ndarray, label: str, target_hw: tuple):
         if arr.shape[2] != 4:
             raise ValueError(f"Channel Mismatch: '{label}' is {arr.shape}, expected (H, W, 3)")
 
-
 # ---  Utilities ---
-
-def ZZalpha_over(under_rgb: np.ndarray, over_rgb: np.ndarray, over_a: np.ndarray) -> np.ndarray:
-    u = under_rgb.astype(np.float32, copy=False)
-    o = over_rgb.astype(np.float32, copy=False)
-    a = over_a[..., None]  # HxWx1
-    return (o * a) + (u * (1.0 - a))
-
+def _lerp_math(current, target, factor):
+    """Internal optimized lerp math."""
+    return current + factor * (target - current)
 
 def _require_buffer(buffers, key, context, spec):
     if key not in buffers:
         raise RuntimeError(f"❌ {context}: Buffer '{key}' not initialized.")
     return buffers[key]
-
-
-def ZZ_validate_surface(surface, key, context, spec, allow_black=False):
-    if surface is None:
-        raise ValueError(f"❌ {context}: Surface '{key}' is None.")
-    if not allow_black and float(np.max(surface)) <= 1e-6:
-        raise ValueError(f"❌ {context}: Surface '{key}' is pure black/empty.")

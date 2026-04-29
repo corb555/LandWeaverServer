@@ -68,11 +68,12 @@ class RenderConfig:
                 )
 
             # 2. modifiers
-            context = "modifier_profiles"
+            context = "modifiers"
             modifiers = {}
-            for mid, data in defs.get("modifier_profiles", {}).items():
+            for mid, data in defs.get("modifiers", {}).items():
                 current_item = mid
                 modifiers[mid] = SurfaceModifierSpec(
+                    op=data.get("op", ""),
                     intensity=float(data["intensity"]), shift_vector=tuple(data["shift_vector"]),
                     noise_id=data["noise_id"], desc=data.get("desc", "")
                 )
@@ -92,12 +93,20 @@ class RenderConfig:
             yaml_factors = {**defs.get("factors", {}), **defs.get("factor_specs", {})}
             for fname, data in yaml_factors.items():
                 current_item = fname
+
+                # SCHEMA V2:  separate Categories from Tuning Params
+                categories = data.get("categories", {})
+                params = data.get("params", {})
+
                 factors.append(
                     FactorSpec(
-                        name=fname, factor_builder=data["factor_builder"],
-                        sources=tuple(d for d in data["sources"]), noise_id=data.get("noise_id"),
-                        required_factors=tuple(data.get("required_factors", [])),
-                        params=data.get("params", {}), desc=data.get("desc", "")
+                        name=fname,
+                        op=data["op"],
+                        sources=tuple(d for d in data.get("sources", [])),
+                        categories=categories,
+                        noise_id=data.get("noise_id"),
+                        params=params,
+                        desc=data.get("desc", "")
                     )
                 )
 
@@ -115,7 +124,7 @@ class RenderConfig:
                     SurfaceSpec(
                         key=to_enum(SurfaceKey, sname), source=to_enum(SourceKey, data["source"]),
                         input_factor=data.get("input_factor"), required_factors=tuple(req_f),
-                        surface_builder=data.get("surface_builder"),
+                        op=data.get("op"),
                         modifiers=data.get("modifiers", []), files=tuple(data.get("files", [])),
                         desc=data.get("desc", "")
                     )
@@ -131,11 +140,11 @@ class RenderConfig:
             context = "pipeline"
             pipeline = []
             for idx, p_def in enumerate(defs.get("pipeline", [])):
-                current_item = f"Step #{idx} ({p_def.get('blend_op', 'unknown')})"
+                current_item = f"Step #{idx} ({p_def.get('op', 'unknown')})"
                 pipeline.append(
                     _BlendSpec(
                         desc=p_def.get("desc", ""), enabled=bool(p_def.get("enabled", True)),
-                        blend_op=p_def["blend_op"], factor=p_def.get("factor"),
+                        op=p_def["op"], factor=p_def.get("factor"),
                         input_surfaces=[to_enum(SurfaceKey, s) for s in
                                         p_def.get("input_surfaces", [])],
                         output_surface=to_enum(SurfaceKey, p_def.get("output_surface")),
@@ -267,7 +276,7 @@ class RenderConfig:
         hash_schema = {
             "topology": ["pipeline", "logic", "source_specs"],
             "logic": ["factors", "factor_specs", "noise_profiles"],
-            "style": ["surfaces", "theme_render", "modifier_profiles", "theme_qml"]
+            "style": ["surfaces", "theme_render", "modifiers", "theme_qml"]
         }
 
         hashes = {}
@@ -282,7 +291,7 @@ class RenderConfig:
                     bucket_data[k] = self.raw_defs[k]
                     continue
 
-                # TODO Remove hard-code of theme_qml and  get from YAML config
+                # TODO Remove hard-code of "theme_qml" and  get from YAML config
                 # 2. FALLBACK: If not in YAML, check if the key refers
                 # to a  file. If so, capture its modification time.
                 if k == "theme_qml":
@@ -355,13 +364,13 @@ def derive_pipeline_requirements(
 
 def _require_blend_ops(pipeline_list: list[_BlendSpec], required_ops: set[str]) -> None:
     enabled = [s for s in pipeline_list if getattr(s, "enabled", True)]
-    enabled_ops = {getattr(s, "blend_op", None) or getattr(s, "action", None) for s in enabled}
+    enabled_ops = {getattr(s, "op", None) or getattr(s, "action", None) for s in enabled}
     enabled_ops.discard(None)
 
     missing = required_ops - enabled_ops
     if missing:
         pretty_enabled = [
-            f"{i}: blend_op={getattr(s, 'blend_op', None)!r} target={getattr(s, 'target', None)!r}"
+            f"{i}: blend_op={getattr(s, 'op', None)!r} target={getattr(s, 'target', None)!r}"
             for i, s in enumerate(enabled)]
         raise ValueError(
             "\n⚠️  PIPELINE CONFIG ERROR\n"
@@ -369,10 +378,10 @@ def _require_blend_ops(pipeline_list: list[_BlendSpec], required_ops: set[str]) 
             "Enabled steps:\n  - " + "\n  - ".join(pretty_enabled) + "\n"
                                                                      "Your pipeline must include "
                                                                      "an enabled "
-                                                                     "blend_op='create_buffer' "
+                                                                     "op='create_buffer' "
                                                                      "step "
                                                                      "before "
-                                                                     "blend_op='output_buffer'.\n"
+                                                                     "op='output_buffer'.\n"
         )
 
 
@@ -381,7 +390,7 @@ def derive_resources(*, render_cfg: RenderConfig) -> RequiredResources:
     Scans the configuration to identify all required resources
     """
     # 1. Identify Demand
-    # We pull the specific pipeline, factors, and surfaces directly from the cfg
+    # We pull the specific pipeline, factors, and surfaces  from the cfg
     preq = derive_pipeline_requirements(
         pipeline=render_cfg.pipeline, surface_specs=render_cfg.surfaces,
         factor_specs=render_cfg.factors
@@ -410,15 +419,18 @@ def derive_resources(*, render_cfg: RenderConfig) -> RequiredResources:
             if ss.source: req_sources.add(ss.source)
             if ss.files: req_files.update(ss.files)
 
+            # SCHEMA V2: modifiers is now a list of profile IDs (strings)
             if ss.modifiers:
-                for mod_cfg in ss.modifiers:
-                    profile_id = mod_cfg.get("mod_profile")
-                    if profile_id:
-                        v_profile = render_cfg.modifiers.get(profile_id)
-                        if v_profile:
+                for profile_id in ss.modifiers:
+                    # Direct lookup of the profile object using the ID from the list
+                    v_profile = render_cfg.modifiers.get(profile_id)
+
+                    if v_profile:
+                        # Register the noise dependency defined in the profile
+                        if v_profile.noise_id:
                             requested_noise_ids.add(v_profile.noise_id)
-                        else:
-                            raise ValueError(f"⚠️ Surface Effect Profile '{profile_id}' not found.")
+                    else:
+                        raise ValueError(f"⚠️ Surface Modifier Profile '{profile_id}' not found.")
 
     # 4. Fulfill Noise Profiles
     # Map the noise IDs to actual NoiseSpec objects stored in the cfg
@@ -440,7 +452,7 @@ def derive_resources(*, render_cfg: RenderConfig) -> RequiredResources:
 
 def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
     """
-    Performs a strict logical audit of the compositing sequence.
+    Performs a  logical audit of the compositing sequence.
     """
     md = GenMarkdown()
     cfg = ctx.render_cfg
@@ -492,8 +504,8 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
                 add_warning(i, f"⚠️ **render Config error:** Factor '{fname}' is not defined.")
 
         # CHECK 3: Buffer Sequence (Using a buffer before initialization)
-        # Operators like 'lerp_buffers' or 'multiply' usually require an existing buffer
-        if step.blend_op not in ["create_buffer"] and step.buffer:
+        # Operators like 'blend_buffers' or 'multiply' usually require an existing buffer
+        if step.op not in ["create_buffer"] and step.buffer:
             if step.buffer not in sim_buffers:
                 add_warning(
                     i, f"⚠️ **render Config error:** Buffer '{step.buffer}' used before "
@@ -501,7 +513,7 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
                 )
 
         # --- UPDATE SIMULATED STATE ---
-        if step.blend_op == "create_buffer":
+        if step.op == "create_buffer":
             sim_buffers.add(step.buffer)
 
         if step.output_surface:
@@ -530,7 +542,7 @@ def analyze_pipeline(ctx: Any) -> tuple[bool, str, list]:
         target = get_exact_val(step.output_surface) if step.output_surface else step.buffer
         warn_icon = "⚠️ " if i in step_with_warnings else ""
         md.header(f"Step {i}) [{target}] {warn_icon}{step.desc}", 3)
-        md.bullet(f"{md.bold('Op:')} `{step.blend_op}`")
+        md.bullet(f"{md.bold('Op:')} `{step.op}`")
 
         if step.factor:
             params = cfg.get_logic(get_exact_val(step.factor))

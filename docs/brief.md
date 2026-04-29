@@ -39,8 +39,8 @@ The system is driven by a user configured compositing sequence:
 
 * **Dynamic Data Sources:** Ingest any raster data (DEM, Precipitation, Forest Height, Lithology) and
   define custom transformation policies.
-* **Logical Blending:** A library of atomic operations including `lerp_surfaces`, `alpha_over`, and
-  `lerp_buffers` for sophisticated transitions.
+* **Logical Blending:** A library of atomic operations including `blend_surfaces`, `alpha_over`, and
+  `blend_buffers` for sophisticated transitions.
 * **Programmable Shading:** Multiplicative hillshade application with highlight/shadow protection logic to
   preserve color vibrancy and "clean" midtones in topographic relief.
 
